@@ -1,14 +1,14 @@
+// src/components/layout/DashboardLayout.tsx
 'use client';
 
 import { useState } from 'react';
 import Sidebar from './Sidebar';
 import Navbar from './Navbar';
 
-// Định nghĩa kiểu dữ liệu cho user
-interface UserProps {
-  name: string;
-  email: string;
-  role: string;
+export interface UserProps {
+  name?: string;
+  email?: string;
+  role?: string;
 }
 
 export default function DashboardLayout({
@@ -16,29 +16,28 @@ export default function DashboardLayout({
   user,
 }: {
   children: React.ReactNode;
-  user: UserProps | null; // Cập nhật lại kiểu ở đây
+  user?: UserProps | null;
 }) {
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
-   return (
-    <div className="flex h-screen bg-gray-50 overflow-hidden">
+  const NavbarComponent = Navbar as any;
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex">
       <Sidebar 
-        isOpen={isSidebarOpen} 
-        setIsOpen={setIsSidebarOpen} 
+        isOpen={sidebarOpen} 
+        setIsOpen={setSidebarOpen} 
+        onClose={() => setSidebarOpen(false)} 
         role={user?.role} 
       />
-      
-      <div className="flex flex-col flex-1 w-full min-w-0">
-        <Navbar 
-          setSidebarOpen={setIsSidebarOpen} 
-          user={user} 
+      <div className="flex-1 flex flex-col min-w-0">
+        <NavbarComponent 
+          setSidebarOpen={setSidebarOpen} 
+          onMenuClick={() => setSidebarOpen(true)} 
+          user={user || null} 
         />
-        
-        <main className="flex-1 overflow-y-auto p-4 md:p-6 lg:p-8">
-          {/* Cấu trúc Max-width cho content để không bị quá rộng trên màn to */}
-          <div className="max-w-7xl mx-auto">
-            {children}
-          </div>
+        <main className="flex-1 p-4 md:p-8 overflow-y-auto">
+          {children}
         </main>
       </div>
     </div>

@@ -12,17 +12,25 @@ import {
   PlusCircle, 
   X 
 } from 'lucide-react';
+import { Dispatch, SetStateAction } from 'react';
 
-interface SidebarProps {
+export interface SidebarProps {
   isOpen?: boolean;
   onClose?: () => void;
+  setIsOpen?: Dispatch<SetStateAction<boolean>>;
+  role?: string;
 }
 
-export default function Sidebar({ isOpen = false, onClose }: SidebarProps) {
+export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: SidebarProps) {
   const pathname = usePathname();
   
-  // Nhận diện nhanh vai trò dựa trên đường dẫn đã được Middleware bảo vệ
-  const isTeacher = pathname.startsWith('/teacher');
+  // Nhận diện vai trò qua đường dẫn hoặc qua prop role
+  const isTeacher = pathname.startsWith('/teacher') || role === 'teacher';
+
+  const handleClose = () => {
+    if (onClose) onClose();
+    if (setIsOpen) setIsOpen(false);
+  };
 
   const studentNavItems = [
     { name: 'Tổng quan', href: '/student', icon: LayoutDashboard },
@@ -44,7 +52,7 @@ export default function Sidebar({ isOpen = false, onClose }: SidebarProps) {
       {isOpen && (
         <div 
           className="fixed inset-0 bg-black/40 z-40 lg:hidden"
-          onClick={onClose}
+          onClick={handleClose}
         />
       )}
 
@@ -63,14 +71,12 @@ export default function Sidebar({ isOpen = false, onClose }: SidebarProps) {
               <BookOpen size={26} />
               <span>FlashLearn</span>
             </Link>
-            {onClose && (
-              <button 
-                onClick={onClose}
-                className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg lg:hidden"
-              >
-                <X size={20} />
-              </button>
-            )}
+            <button 
+              onClick={handleClose}
+              className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg lg:hidden"
+            >
+              <X size={20} />
+            </button>
           </div>
 
           {/* Nhãn phân quyền */}
@@ -86,7 +92,6 @@ export default function Sidebar({ isOpen = false, onClose }: SidebarProps) {
           <nav className="p-4 space-y-1.5">
             {navItems.map((item) => {
               const Icon = item.icon;
-              // Kiểm tra trang hiện tại để tô đậm nút menu
               const isActive = 
                 item.href === '/student' || item.href === '/teacher'
                   ? pathname === item.href
@@ -96,7 +101,7 @@ export default function Sidebar({ isOpen = false, onClose }: SidebarProps) {
                 <Link
                   key={item.href}
                   href={item.href}
-                  onClick={onClose}
+                  onClick={handleClose}
                   className={`flex items-center gap-3 px-4 py-3 rounded-xl font-semibold text-sm transition ${
                     isActive
                       ? 'bg-blue-50 text-blue-600'
