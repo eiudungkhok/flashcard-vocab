@@ -251,14 +251,13 @@ export default function LandingPage() {
                 <ArrowRight size={20} />
               </Link>
 
-              <Link
-                href={isLoggedIn ? '/student/explore' : '/register'}
-                className={`w-full sm:w-auto px-7 py-4 rounded-2xl font-bold text-base border transition flex items-center justify-center gap-2 ${t.cardBg} hover:opacity-90`}
-              >
-                <Globe size={19} className={t.accentText} />
-                <span>{isLoggedIn ? 'Khám phá kho từ vựng' : 'Tạo tài khoản miễn phí'}</span>
-              </Link>
-            </div>
+<Link
+  href={isLoggedIn ? '/student/explore' : '/register'}
+  className={`w-full sm:w-auto px-7 py-4 rounded-2xl font-bold text-base border transition flex items-center justify-center gap-2 ${t.cardBg} hover:opacity-90`}
+>
+  <Globe size={19} className={t.accentText} />
+  <span>{isLoggedIn ? 'Khám phá kho từ vựng' : 'Tạo tài khoản miễn phí'}</span>
+</Link>            </div>
 
             <div className={`pt-4 flex flex-wrap items-center justify-center lg:justify-start gap-6 text-xs font-semibold ${t.textSub}`}>
               <span className="flex items-center gap-1.5">
