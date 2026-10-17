@@ -10,6 +10,7 @@ import {
   Layers, 
   GraduationCap, 
   PlusCircle, 
+  BarChart3,
   X 
 } from 'lucide-react';
 import { Dispatch, SetStateAction } from 'react';
@@ -24,7 +25,6 @@ export interface SidebarProps {
 export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: SidebarProps) {
   const pathname = usePathname();
   
-  // Nhận diện vai trò qua đường dẫn hoặc qua prop role
   const isTeacher = pathname.startsWith('/teacher') || role === 'teacher';
 
   const handleClose = () => {
@@ -36,6 +36,7 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
     { name: 'Tổng quan', href: '/student', icon: LayoutDashboard },
     { name: 'Thư viện khám phá', href: '/student/explore', icon: Compass },
     { name: 'Ôn tập hôm nay', href: '/student/study', icon: Layers },
+    { name: 'Thống kê & Truy cập', href: '/student/analytics', icon: BarChart3 },
   ];
 
   const teacherNavItems = [
@@ -48,7 +49,6 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
 
   return (
     <>
-      {/* Lớp phủ mờ trên màn hình điện thoại */}
       {isOpen && (
         <div 
           className="fixed inset-0 bg-black/40 z-40 lg:hidden"
@@ -62,7 +62,6 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
         }`}
       >
         <div>
-          {/* Logo Header */}
           <div className="h-16 flex items-center justify-between px-6 border-b border-gray-100">
             <Link 
               href={isTeacher ? '/teacher' : '/student'} 
@@ -79,7 +78,6 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
             </button>
           </div>
 
-          {/* Nhãn phân quyền */}
           <div className="px-6 pt-5 pb-2">
             <span className={`inline-block text-[11px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md ${
               isTeacher ? 'bg-purple-50 text-purple-600' : 'bg-blue-50 text-blue-600'
@@ -88,7 +86,6 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
             </span>
           </div>
 
-          {/* Danh sách Menu */}
           <nav className="p-4 space-y-1.5">
             {navItems.map((item) => {
               const Icon = item.icon;
@@ -116,7 +113,6 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
           </nav>
         </div>
 
-        {/* Footer */}
         <div className="p-6 border-t border-gray-100 text-xs text-gray-400 font-medium">
           © 2026 FlashLearn App
         </div>
