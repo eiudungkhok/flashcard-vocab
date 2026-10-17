@@ -3,7 +3,6 @@
 
 import { createClient } from '@/utils/supabase/server';
 import { revalidatePath } from 'next/cache';
-import { randomUUID } from 'crypto';
 
 // 1. Công thức tính khoảng cách lặp lại (dựa trên thuật toán SuperMemo-2)
 function calculateSRS(grade: number, currentInterval: number, currentEase: number, currentRepetitions: number) {
@@ -35,28 +34,20 @@ function calculateSRS(grade: number, currentInterval: number, currentEase: numbe
     interval,
     easeFactor,
     repetitions,
-    nextReview: nextReviewDate.toISOString(),
+    nextReview: nextReviewDate.toISOString()
   };
 }
 
-export interface ReviewTelemetryMeta {
-  eventId?: string;
-  studySessionId?: string | null;
-  visitId?: string | null;
-  durationMs?: number | null;
-}
-
-// 2. Hàm cập nhật tiến độ học 1 thẻ & Ghi nhận vào bảng review_logs + study_sessions
-export async function updateCardProgress(cardId: string, grade: number, meta?: ReviewTelemetryMeta) {
+// 2. Hàm cập nhật tiến độ học 1 thẻ (Tách biệt hoàn toàn theo từng tài khoản Học viên)
+export async function updateCardProgress(cardId: string, grade: number) {
   const supabase = await createClient();
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
   if (!user) {
     return { success: false, error: 'Bạn chưa đăng nhập!' };
   }
 
+  // Lấy thông tin thẻ để biết thẻ thuộc bộ từ vựng (deck_id) nào
   const { data: card, error: fetchError } = await supabase
     .from('cards')
     .select('id, deck_id')
@@ -87,137 +78,40 @@ export async function updateCardProgress(cardId: string, grade: number, meta?: R
     currentRepetitions
   );
 
-  const nowIso = new Date().toISOString();
-
-  // Lưu tiến độ vào bảng card_progress của riêng học viên
-  const { error: upsertError } = await supabase.from('card_progress').upsert(
-    {
-      user_id: user.id,
-      deck_id: card.deck_id,
-      card_id: card.id,
-      interval,
-      ease_factor: easeFactor,
-      repetitions,
-      next_review: nextReview,
-      updated_at: nowIso,
-    },
-    { onConflict: 'user_id,card_id' }
-  );
+  // Lưu (Upsert) tiến độ vào bảng card_progress của riêng học viên này
+  const { error: upsertError } = await supabase
+    .from('card_progress')
+    .upsert(
+      {
+        user_id: user.id,
+        deck_id: card.deck_id,
+        card_id: card.id,
+        interval,
+        ease_factor: easeFactor,
+        repetitions,
+        next_review: nextReview,
+        updated_at: new Date().toISOString()
+      },
+      { onConflict: 'user_id,card_id' }
+    );
 
   if (upsertError) {
     console.error('Lỗi khi lưu tiến độ cá nhân:', upsertError);
     return { success: false, error: 'Không thể lưu tiến độ học tập' };
   }
 
-  // Ghi nhận vào bảng review_logs (Chống ghi trùng bằng event_id)
-  const eventId = meta?.eventId || randomUUID();
-  const isRemembered = grade >= 3;
-  // Giới hạn thời gian suy nghĩ hợp lệ mỗi thẻ (tối đa 120s để không tính thời gian treo máy)
-  const safeDurationMs =
-    typeof meta?.durationMs === 'number' && meta.durationMs > 0
-      ? Math.min(meta.durationMs, 120_000)
-      : null;
-
-  await supabase.from('review_logs').upsert(
-    {
-      event_id: eventId,
-      user_id: user.id,
-      study_session_id: meta?.studySessionId || null,
-      visit_id: meta?.visitId || null,
-      deck_id: card.deck_id,
-      card_id: card.id,
-      grade,
-      is_remembered: isRemembered,
-      duration_ms: safeDurationMs,
-      interval_before: currentInterval,
-      interval_after: interval,
-      ease_before: currentEase,
-      ease_after: easeFactor,
-      reviewed_at: nowIso,
-    },
-    { onConflict: 'event_id', ignoreDuplicates: true }
-  );
-
-  // Đồng bộ thống kê cho buổi học (study_sessions) nếu có
-  if (meta?.studySessionId) {
-    const { data: sessionLogs } = await supabase
-      .from('review_logs')
-      .select('card_id, is_remembered')
-      .eq('study_session_id', meta.studySessionId)
-      .eq('user_id', user.id);
-
-    if (sessionLogs) {
-      const uniqueCards = new Set(sessionLogs.map((l) => l.card_id)).size;
-      const totalReviews = sessionLogs.length;
-      const remembered = sessionLogs.filter((l) => l.is_remembered).length;
-      const forgotten = totalReviews - remembered;
-
-      await supabase
-        .from('study_sessions')
-        .update({
-          last_activity_at: nowIso,
-          cards_studied_count: uniqueCards,
-          reviews_count: totalReviews,
-          remembered_count: remembered,
-          forgotten_count: forgotten,
-        })
-        .eq('id', meta.studySessionId)
-        .eq('user_id', user.id);
-    }
-  }
-
-  revalidatePath('/student/study');
+  // Chỉ làm mới Dashboard, trang chi tiết bộ bài và trang Thống kê (KHÔNG revalidate '/student/study' khi đang lật thẻ)
   revalidatePath(`/student/decks/${card.deck_id}`);
-  revalidatePath('/student');
-  revalidatePath('/student/analytics');
-  return { success: true };
-}
-
-// 3. Hàm Lưu Mục tiêu học tập mỗi ngày của Học viên (HV9)
-export async function saveStudentGoal(dailyCardsGoal: number, dailyMinutesGoal: number) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
-
-  const cardsGoal = Math.max(1, Math.min(1000, Math.round(dailyCardsGoal)));
-  const minutesGoal = Math.max(1, Math.min(720, Math.round(dailyMinutesGoal)));
-
-  const { error } = await supabase.from('student_goals').upsert(
-    {
-      user_id: user.id,
-      daily_cards_goal: cardsGoal,
-      daily_minutes_goal: minutesGoal,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: 'user_id' }
-  );
-
-  if (error) {
-    console.error('Lỗi lưu mục tiêu:', error);
-    return { success: false, error: 'Không thể lưu mục tiêu học tập.' };
-  }
-
   revalidatePath('/student/analytics');
   revalidatePath('/student');
   return { success: true };
 }
 
-// 4. Hàm tạo bộ từ vựng mới
-export async function createNewDeck(
-  title: string,
-  description: string,
-  cards: any[],
-  courseId: string | null = null,
-  isPublic: boolean = false
-) {
+// 3. Hàm tạo bộ từ vựng mới (Tự động bật Public nếu không thuộc khóa học nào)
+export async function createNewDeck(title: string, description: string, cards: any[], courseId: string | null = null, isPublic: boolean = false) {
   const supabase = await createClient();
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
   if (!user) {
     return { success: false, error: 'Bạn chưa đăng nhập!' };
   }
@@ -232,7 +126,7 @@ export async function createNewDeck(
       description: description,
       user_id: user.id,
       course_id: finalCourseId,
-      is_public: finalIsPublic,
+      is_public: finalIsPublic
     })
     .select('id')
     .single();
@@ -242,16 +136,18 @@ export async function createNewDeck(
     return { success: false, error: 'Không thể tạo bộ từ vựng' };
   }
 
-  const cardsToInsert = cards.map((card) => ({
+  const cardsToInsert = cards.map(card => ({
     deck_id: newDeck.id,
     user_id: user.id,
     term: card.term,
     phonetic: card.phonetic,
     definition: card.definition,
-    example: card.example,
+    example: card.example
   }));
 
-  const { error: cardsError } = await supabase.from('cards').insert(cardsToInsert);
+  const { error: cardsError } = await supabase
+    .from('cards')
+    .insert(cardsToInsert);
 
   if (cardsError) {
     console.error('Lỗi tạo thẻ:', cardsError);
@@ -266,15 +162,13 @@ export async function createNewDeck(
   return { success: true };
 }
 
-// 5. Hàm Cập nhật thông tin Bộ từ vựng
+// 4. Hàm Cập nhật thông tin Bộ từ vựng
 export async function updateDeckInfo(
   deckId: string,
   data: { title: string; description: string; courseId: string | null; isPublic: boolean }
 ) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
@@ -287,7 +181,7 @@ export async function updateDeckInfo(
       title: data.title,
       description: data.description,
       course_id: finalCourseId,
-      is_public: finalIsPublic,
+      is_public: finalIsPublic
     })
     .eq('id', deckId)
     .eq('user_id', user.id);
@@ -305,18 +199,20 @@ export async function updateDeckInfo(
   return { success: true };
 }
 
-// 6. Hàm Xóa Bộ từ vựng
+// 5. Hàm Xóa Bộ từ vựng
 export async function deleteDeck(deckId: string) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
   await supabase.from('cards').delete().eq('deck_id', deckId);
 
-  const { error } = await supabase.from('decks').delete().eq('id', deckId).eq('user_id', user.id);
+  const { error } = await supabase
+    .from('decks')
+    .delete()
+    .eq('id', deckId)
+    .eq('user_id', user.id);
 
   if (error) {
     console.error('Lỗi xóa bộ từ vựng:', error);
@@ -330,26 +226,23 @@ export async function deleteDeck(deckId: string) {
   return { success: true };
 }
 
-// 7. Hàm Thêm 1 thẻ từ vựng lẻ vào Bộ từ vựng
-export async function addCardToDeck(
-  deckId: string,
-  card: { term: string; phonetic: string; definition: string; example: string }
-) {
+// 6. Hàm Thêm 1 thẻ từ vựng lẻ vào Bộ từ vựng
+export async function addCardToDeck(deckId: string, card: { term: string; phonetic: string; definition: string; example: string }) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
-  const { error } = await supabase.from('cards').insert({
-    deck_id: deckId,
-    user_id: user.id,
-    term: card.term,
-    phonetic: card.phonetic,
-    definition: card.definition,
-    example: card.example,
-  });
+  const { error } = await supabase
+    .from('cards')
+    .insert({
+      deck_id: deckId,
+      user_id: user.id,
+      term: card.term,
+      phonetic: card.phonetic,
+      definition: card.definition,
+      example: card.example
+    });
 
   if (error) {
     console.error('Lỗi thêm thẻ:', error);
@@ -362,16 +255,14 @@ export async function addCardToDeck(
   return { success: true };
 }
 
-// 8. Hàm Chỉnh sửa nội dung 1 thẻ từ vựng
+// 7. Hàm Chỉnh sửa nội dung 1 thẻ từ vựng
 export async function updateCard(
   cardId: string,
   deckId: string,
   card: { term: string; phonetic: string; definition: string; example: string }
 ) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
@@ -381,7 +272,7 @@ export async function updateCard(
       term: card.term,
       phonetic: card.phonetic,
       definition: card.definition,
-      example: card.example,
+      example: card.example
     })
     .eq('id', cardId);
 
@@ -395,16 +286,17 @@ export async function updateCard(
   return { success: true };
 }
 
-// 9. Hàm Xóa 1 thẻ từ vựng lẻ
+// 8. Hàm Xóa 1 thẻ từ vựng lẻ
 export async function deleteCard(cardId: string, deckId: string) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
-  const { error } = await supabase.from('cards').delete().eq('id', cardId);
+  const { error } = await supabase
+    .from('cards')
+    .delete()
+    .eq('id', cardId);
 
   if (error) {
     console.error('Lỗi xóa thẻ:', error);
@@ -417,22 +309,22 @@ export async function deleteCard(cardId: string, deckId: string) {
   return { success: true };
 }
 
-// 10. Hàm tạo Khóa học mới
+// 9. Hàm tạo Khóa học mới
 export async function createNewCourse(title: string, description: string) {
   const supabase = await createClient();
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
   if (!user) {
     return { success: false, error: 'Bạn chưa đăng nhập!' };
   }
 
-  const { error } = await supabase.from('courses').insert({
-    title: title,
-    description: description,
-    teacher_id: user.id,
-  });
+  const { error } = await supabase
+    .from('courses')
+    .insert({
+      title: title,
+      description: description,
+      teacher_id: user.id
+    });
 
   if (error) {
     console.error('Lỗi tạo khóa học:', error);
@@ -444,12 +336,10 @@ export async function createNewCourse(title: string, description: string) {
   return { success: true };
 }
 
-// 11. Hàm Chỉnh sửa thông tin Khóa học
+// 10. Hàm Chỉnh sửa thông tin Khóa học
 export async function updateCourse(courseId: string, title: string, description: string) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
@@ -457,7 +347,7 @@ export async function updateCourse(courseId: string, title: string, description:
     .from('courses')
     .update({
       title: title,
-      description: description,
+      description: description
     })
     .eq('id', courseId)
     .eq('teacher_id', user.id);
@@ -473,12 +363,10 @@ export async function updateCourse(courseId: string, title: string, description:
   return { success: true };
 }
 
-// 12. Hàm Xóa Khóa học
+// 11. Hàm Xóa Khóa học
 export async function deleteCourse(courseId: string) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
@@ -499,19 +387,19 @@ export async function deleteCourse(courseId: string) {
   return { success: true };
 }
 
-// 13. Hàm Đăng ký Khóa học (dành cho Học viên)
+// 12. Hàm Đăng ký Khóa học (dành cho Học viên)
 export async function enrollInCourse(courseId: string) {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
+  const { data: { user } } = await supabase.auth.getUser();
+  
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
-  const { error } = await supabase.from('enrollments').insert({
-    course_id: courseId,
-    student_id: user.id,
-  });
+  const { error } = await supabase
+    .from('enrollments')
+    .insert({
+      course_id: courseId,
+      student_id: user.id
+    });
 
   if (error) {
     if (error.code === '23505') {
