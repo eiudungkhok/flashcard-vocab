@@ -36,7 +36,7 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
     { name: 'Tổng quan', href: '/student', icon: LayoutDashboard },
     { name: 'Thư viện khám phá', href: '/student/explore', icon: Compass },
     { name: 'Ôn tập hôm nay', href: '/student/study', icon: Layers },
-    { name: 'Thống kê & Truy cập', href: '/student/analytics', icon: BarChart3 },
+    { name: 'Thống kê học tập', href: '/student/analytics', icon: BarChart3 },
   ];
 
   const teacherNavItems = [
