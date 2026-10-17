@@ -1,6 +1,9 @@
 // src/app/(dashboard)/student/analytics/page.tsx
+'use client';
+
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { createClient } from '@/utils/supabase/server';
+import { createClient } from '@/utils/supabase/client';
 import { 
   BarChart3, 
   Clock, 
@@ -10,10 +13,9 @@ import {
   BookOpen, 
   Monitor, 
   Calendar,
-  ArrowUpRight
+  ArrowUpRight,
+  Loader2
 } from 'lucide-react';
-
-export const dynamic = 'force-dynamic';
 
 function formatDuration(totalSeconds: number) {
   if (!totalSeconds || totalSeconds <= 0) return '0 phút';
@@ -26,61 +28,101 @@ function formatDuration(totalSeconds: number) {
   return `${seconds} giây`;
 }
 
-export default async function StudentAnalyticsPage() {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
+export default function StudentAnalyticsPage() {
+  const supabase = createClient();
 
-  // 1. Lấy dữ liệu thời gian học từ Telemetry đã lưu trong hồ sơ học viên
-  const telemetry = user?.user_metadata?.telemetry_stats || {
+  const [isLoading, setIsLoading] = useState(true);
+  const [telemetry, setTelemetry] = useState<any>({
     totalSec: 0,
     studySec: 0,
     daily: {},
     lastDevice: 'Desktop',
-  };
+  });
+  const [allProgress, setAllProgress] = useState<any[]>([]);
+  const [decks, setDecks] = useState<any[]>([]);
+  const [cardsMap, setCardsMap] = useState<Record<string, any>>({});
 
-  // Lấy ngày hôm nay theo múi giờ Việt Nam (UTC+7)
+  useEffect(() => {
+    // 1. Đọc thời gian học thực tế từ trình duyệt và tự động cập nhật mỗi 5 giây
+    const loadLocalTelemetry = () => {
+      try {
+        const raw = localStorage.getItem('flashlearn_telemetry_stats');
+        if (raw) {
+          setTelemetry(JSON.parse(raw));
+        }
+      } catch (e) {}
+    };
+
+    loadLocalTelemetry();
+    const timer = setInterval(loadLocalTelemetry, 5000);
+
+    // 2. Tải dữ liệu tiến độ SRS từ Supabase
+    const fetchAnalyticsData = async () => {
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
+          setIsLoading(false);
+          return;
+        }
+
+        const { data: progressList } = await supabase
+          .from('card_progress')
+          .select('card_id, deck_id, interval, ease_factor, repetitions, next_review, updated_at')
+          .eq('user_id', user.id)
+          .order('updated_at', { ascending: false });
+
+        const progress = progressList || [];
+        setAllProgress(progress);
+
+        const studiedDeckIds = Array.from(new Set(progress.map((p: any) => p.deck_id)));
+        const studiedCardIds = progress.map((p: any) => p.card_id);
+
+        if (studiedDeckIds.length > 0) {
+          const { data: decksData } = await supabase
+            .from('decks')
+            .select('id, title, cards(count)')
+            .in('id', studiedDeckIds);
+          setDecks(decksData || []);
+        }
+
+        if (studiedCardIds.length > 0) {
+          const { data: recentCardsData } = await supabase
+            .from('cards')
+            .select('id, term, definition, deck_id')
+            .in('id', studiedCardIds.slice(0, 10));
+
+          const mapObj: Record<string, any> = {};
+          (recentCardsData || []).forEach((c: any) => {
+            mapObj[c.id] = c;
+          });
+          setCardsMap(mapObj);
+        }
+      } catch (err) {
+        console.error('Lỗi tải dữ liệu thống kê:', err);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchAnalyticsData();
+
+    return () => clearInterval(timer);
+  }, [supabase]);
+
+  // Tính toán các chỉ số hiển thị
   const todayVN = new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10);
   const todayStudySec = Number(telemetry.daily?.[todayVN] || 0);
   const totalActiveSec = Number(telemetry.totalSec || 0);
 
-  // 2. Lấy toàn bộ tiến độ học thẻ SRS của riêng học viên từ bảng card_progress
-  const { data: progressList } = user
-    ? await supabase
-        .from('card_progress')
-        .select('card_id, deck_id, interval, ease_factor, repetitions, next_review, updated_at')
-        .eq('user_id', user.id)
-        .order('updated_at', { ascending: false })
-    : { data: [] };
-
-  const allProgress = progressList || [];
-
-  // 3. Lấy thông tin các bộ từ vựng & thẻ từ đã học để thống kê chi tiết
-  const studiedDeckIds = Array.from(new Set(allProgress.map(p => p.deck_id)));
-  const studiedCardIds = allProgress.map(p => p.card_id);
-
-  const { data: decks } = studiedDeckIds.length > 0
-    ? await supabase
-        .from('decks')
-        .select('id, title, cards(count)')
-        .in('id', studiedDeckIds)
-    : { data: [] };
-
-  const { data: recentCardsData } = studiedCardIds.length > 0
-    ? await supabase
-        .from('cards')
-        .select('id, term, definition, deck_id')
-        .in('id', studiedCardIds.slice(0, 10))
-    : { data: [] };
-
-  const cardMap = new Map((recentCardsData || []).map(c => [c.id, c]));
-  const deckMap = new Map((decks || []).map(d => [d.id, d]));
-
-  // 4. Tính toán các chỉ số SRS
   const totalLearnedCards = allProgress.length;
-  const masteredCards = allProgress.filter(p => (p.repetitions || 0) >= 2 || (p.interval || 0) >= 6).length;
+  const masteredCards = allProgress.filter(
+    (p) => (p.repetitions || 0) >= 2 || (p.interval || 0) >= 6
+  ).length;
   const learningCards = totalLearnedCards - masteredCards;
 
-  // Tính số ngày học trong 7 ngày gần nhất
+  const studiedDeckIds = Array.from(new Set(allProgress.map((p) => p.deck_id)));
+  const deckMap = new Map(decks.map((d) => [d.id, d]));
+
   const last7Days = Array.from({ length: 7 }, (_, i) => {
     const d = new Date(Date.now() + 7 * 3600 * 1000 - (6 - i) * 86400000);
     const dateKey = d.toISOString().slice(0, 10);
@@ -89,7 +131,16 @@ export default async function StudentAnalyticsPage() {
     return { dateKey, label, seconds };
   });
 
-  const maxDailySec = Math.max(...last7Days.map(d => d.seconds), 60);
+  const maxDailySec = Math.max(...last7Days.map((d) => d.seconds), 60);
+
+  if (isLoading) {
+    return (
+      <div className="min-h-96 flex flex-col items-center justify-center gap-3 text-gray-500">
+        <Loader2 size={32} className="animate-spin text-blue-600" />
+        <p className="text-sm font-semibold">Đang tải dữ liệu thống kê học tập...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-8 animate-in fade-in duration-500 pb-12">
@@ -169,13 +220,13 @@ export default async function StudentAnalyticsPage() {
               <Calendar size={20} className="text-blue-600" />
               Thời gian hoạt động 7 ngày qua
             </h2>
-            <p className="text-xs text-gray-500 mb-6">Tự động ghi nhận mỗi 15 giây khi bạn mở trang học tập</p>
+            <p className="text-xs text-gray-500 mb-6">Cập nhật theo thời gian thực khi bạn mở trang học tập</p>
           </div>
 
           <div className="h-52 flex items-end justify-between gap-3 pt-6 px-2 border-b border-gray-100">
             {last7Days.map((day) => {
               const heightPercent = Math.max(Math.round((day.seconds / maxDailySec) * 100), day.seconds > 0 ? 12 : 4);
-              const minutes = Math.round(day.seconds / 60);
+              const minutes = Math.floor(day.seconds / 60);
 
               return (
                 <div key={day.dateKey} className="flex-1 flex flex-col items-center gap-2 h-full justify-end">
@@ -205,10 +256,10 @@ export default async function StudentAnalyticsPage() {
           <p className="text-xs text-gray-500 mb-6">Tỷ lệ từ vựng bạn đã lật học trong từng bộ bài</p>
 
           <div className="space-y-4">
-            {decks && decks.length > 0 ? (
+            {decks.length > 0 ? (
               decks.map((deck: any) => {
                 const totalCardsInDeck = deck.cards?.[0]?.count || 1;
-                const learnedInDeck = allProgress.filter(p => p.deck_id === deck.id).length;
+                const learnedInDeck = allProgress.filter((p) => p.deck_id === deck.id).length;
                 const percent = Math.min(Math.round((learnedInDeck / totalCardsInDeck) * 100), 100);
 
                 return (
@@ -265,7 +316,7 @@ export default async function StudentAnalyticsPage() {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {allProgress.slice(0, 10).map((item) => {
-                const cardInfo = cardMap.get(item.card_id);
+                const cardInfo = cardsMap[item.card_id];
                 const deckInfo = deckMap.get(item.deck_id);
                 if (!cardInfo) return null;
 
