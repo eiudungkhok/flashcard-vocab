@@ -11,6 +11,7 @@ import {
   GraduationCap, 
   PlusCircle, 
   BarChart3,
+  Activity,
   X 
 } from 'lucide-react';
 import { Dispatch, SetStateAction } from 'react';
@@ -41,6 +42,7 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
 
   const teacherNavItems = [
     { name: 'Tổng quan', href: '/teacher', icon: LayoutDashboard },
+    { name: 'Thống kê & Lưu lượng', href: '/teacher/analytics', icon: Activity },
     { name: 'Quản lý khóa học', href: '/teacher/courses', icon: GraduationCap },
     { name: 'Tạo bộ từ vựng', href: '/teacher/decks/new', icon: PlusCircle },
   ];
@@ -57,7 +59,7 @@ export default function Sidebar({ isOpen = false, onClose, setIsOpen, role }: Si
       )}
 
       <aside 
-        className={`fixed top-0 left-0 z-50 h-screen w-64 bg-white border-r border-gray-200 flex flex-col justify-between transition-transform duration-300 lg:sticky lg:translate-x-0 ${
+        className={`fixed top-0 left-0 z-50 h-screen w-64 bg-white border-r border-gray-200 flex flex-col justify-between transition-transform duration-300 lg:sticky lg:translate-x-0 print:hidden ${
           isOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >

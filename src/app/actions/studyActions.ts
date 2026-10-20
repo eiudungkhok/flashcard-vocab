@@ -4,7 +4,7 @@
 import { createClient } from '@/utils/supabase/server';
 import { revalidatePath } from 'next/cache';
 
-// 1. Công thức tính khoảng cách lặp lại (dựa trên thuật toán SuperMemo-2)
+// 1. Công thức tính khoảng cách lặp lại (SuperMemo-2)
 function calculateSRS(grade: number, currentInterval: number, currentEase: number, currentRepetitions: number) {
   let interval = 0;
   let easeFactor = currentEase;
@@ -34,32 +34,35 @@ function calculateSRS(grade: number, currentInterval: number, currentEase: numbe
     interval,
     easeFactor,
     repetitions,
-    nextReview: nextReviewDate.toISOString()
+    nextReview: nextReviewDate.toISOString(),
   };
 }
 
-// 2. Hàm cập nhật tiến độ học 1 thẻ (Tách biệt hoàn toàn theo từng tài khoản Học viên)
+// 2. Cập nhật tiến độ thẻ SRS + Ghi nhận Buổi học (study_sessions) & Lượt ôn (review_logs) dùng chung
 export async function updateCardProgress(cardId: string, grade: number) {
   const supabase = await createClient();
 
-  const { data: { user } } = await supabase.auth.getUser();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) {
     return { success: false, error: 'Bạn chưa đăng nhập!' };
   }
 
-  // Lấy thông tin thẻ để biết thẻ thuộc bộ từ vựng (deck_id) nào
   const { data: card, error: fetchError } = await supabase
     .from('cards')
-    .select('id, deck_id')
+    .select('id, deck_id, decks(course_id)')
     .eq('id', cardId)
     .single();
 
   if (fetchError || !card) {
-    console.error('Lỗi khi lấy thông tin thẻ:', fetchError);
     return { success: false, error: 'Không tìm thấy thẻ' };
   }
 
-  // Lấy tiến độ hiện tại của RIÊNG học viên này trong bảng card_progress
+  const courseId = Array.isArray(card.decks)
+    ? card.decks[0]?.course_id
+    : (card.decks as any)?.course_id || null;
+
   const { data: existingProgress } = await supabase
     .from('card_progress')
     .select('interval, ease_factor, repetitions')
@@ -78,7 +81,9 @@ export async function updateCardProgress(cardId: string, grade: number) {
     currentRepetitions
   );
 
-  // Lưu (Upsert) tiến độ vào bảng card_progress của riêng học viên này
+  const nowIso = new Date().toISOString();
+
+  // Upsert tiến độ thẻ cá nhân
   const { error: upsertError } = await supabase
     .from('card_progress')
     .upsert(
@@ -90,31 +95,93 @@ export async function updateCardProgress(cardId: string, grade: number) {
         ease_factor: easeFactor,
         repetitions,
         next_review: nextReview,
-        updated_at: new Date().toISOString()
+        updated_at: nowIso,
       },
       { onConflict: 'user_id,card_id' }
     );
 
   if (upsertError) {
-    console.error('Lỗi khi lưu tiến độ cá nhân:', upsertError);
     return { success: false, error: 'Không thể lưu tiến độ học tập' };
   }
 
-  // Chỉ làm mới Dashboard, trang chi tiết bộ bài và trang Thống kê (KHÔNG revalidate '/student/study' khi đang lật thẻ)
+  // Tìm hoặc tạo Buổi học (study_sessions) trong 30 phút gần nhất cho bộ thẻ này
+  const sessionCutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { data: activeSession } = await supabase
+    .from('study_sessions')
+    .select('id, started_at, cards_reviewed')
+    .eq('user_id', user.id)
+    .eq('deck_id', card.deck_id)
+    .gte('last_interaction_at', sessionCutoff)
+    .order('last_interaction_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  let sessionId = activeSession?.id || null;
+  if (activeSession) {
+    const elapsedSec = Math.max(
+      5,
+      Math.min(3600, Math.round((Date.now() - new Date(activeSession.started_at).getTime()) / 1000))
+    );
+    await supabase
+      .from('study_sessions')
+      .update({
+        last_interaction_at: nowIso,
+        ended_at: nowIso,
+        cards_reviewed: (activeSession.cards_reviewed || 0) + 1,
+        duration_sec: elapsedSec,
+      })
+      .eq('id', activeSession.id);
+  } else {
+    const { data: newSession } = await supabase
+      .from('study_sessions')
+      .insert({
+        user_id: user.id,
+        deck_id: card.deck_id,
+        course_id: courseId,
+        started_at: nowIso,
+        last_interaction_at: nowIso,
+        ended_at: nowIso,
+        cards_reviewed: 1,
+        duration_sec: 10,
+      })
+      .select('id')
+      .single();
+    sessionId = newSession?.id || null;
+  }
+
+  // Ghi log lượt ôn vào review_logs (phục vụ thống kê cả Học viên & Giảng viên)
+  await supabase.from('review_logs').insert({
+    session_id: sessionId,
+    user_id: user.id,
+    deck_id: card.deck_id,
+    card_id: card.id,
+    course_id: courseId,
+    grade,
+    is_remembered: grade >= 3,
+    interval_after: interval,
+    ease_after: easeFactor,
+    reviewed_at: nowIso,
+  });
+
   revalidatePath(`/student/decks/${card.deck_id}`);
   revalidatePath('/student/analytics');
   revalidatePath('/student');
   return { success: true };
 }
 
-// 3. Hàm tạo bộ từ vựng mới (Tự động bật Public nếu không thuộc khóa học nào)
-export async function createNewDeck(title: string, description: string, cards: any[], courseId: string | null = null, isPublic: boolean = false) {
+// 3. Tạo bộ từ vựng mới
+export async function createNewDeck(
+  title: string,
+  description: string,
+  cards: any[],
+  courseId: string | null = null,
+  isPublic: boolean = false
+) {
   const supabase = await createClient();
-
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) {
-    return { success: false, error: 'Bạn chưa đăng nhập!' };
-  }
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
   const finalCourseId = courseId && courseId.trim() !== '' ? courseId : null;
   const finalIsPublic = !finalCourseId ? true : isPublic;
@@ -122,35 +189,31 @@ export async function createNewDeck(title: string, description: string, cards: a
   const { data: newDeck, error: deckError } = await supabase
     .from('decks')
     .insert({
-      title: title,
-      description: description,
+      title,
+      description,
       user_id: user.id,
       course_id: finalCourseId,
-      is_public: finalIsPublic
+      is_public: finalIsPublic,
     })
     .select('id')
     .single();
 
   if (deckError || !newDeck) {
-    console.error('Lỗi tạo bộ từ vựng:', deckError);
     return { success: false, error: 'Không thể tạo bộ từ vựng' };
   }
 
-  const cardsToInsert = cards.map(card => ({
+  const cardsToInsert = cards.map((card) => ({
     deck_id: newDeck.id,
     user_id: user.id,
     term: card.term,
     phonetic: card.phonetic,
     definition: card.definition,
-    example: card.example
+    example: card.example,
   }));
 
-  const { error: cardsError } = await supabase
-    .from('cards')
-    .insert(cardsToInsert);
+  const { error: cardsError } = await supabase.from('cards').insert(cardsToInsert);
 
   if (cardsError) {
-    console.error('Lỗi tạo thẻ:', cardsError);
     await supabase.from('decks').delete().eq('id', newDeck.id);
     return { success: false, error: 'Không thể lưu danh sách thẻ' };
   }
@@ -162,14 +225,15 @@ export async function createNewDeck(title: string, description: string, cards: a
   return { success: true };
 }
 
-// 4. Hàm Cập nhật thông tin Bộ từ vựng
+// 4. Cập nhật thông tin Bộ từ vựng
 export async function updateDeckInfo(
   deckId: string,
   data: { title: string; description: string; courseId: string | null; isPublic: boolean }
 ) {
   const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
   const finalCourseId = data.courseId && data.courseId.trim() !== '' ? data.courseId : null;
@@ -181,15 +245,12 @@ export async function updateDeckInfo(
       title: data.title,
       description: data.description,
       course_id: finalCourseId,
-      is_public: finalIsPublic
+      is_public: finalIsPublic,
     })
     .eq('id', deckId)
     .eq('user_id', user.id);
 
-  if (error) {
-    console.error('Lỗi cập nhật bộ từ vựng:', error);
-    return { success: false, error: 'Không thể cập nhật thông tin bộ từ vựng.' };
-  }
+  if (error) return { success: false, error: 'Không thể cập nhật thông tin bộ từ vựng.' };
 
   revalidatePath(`/teacher/decks/${deckId}`);
   revalidatePath('/teacher');
@@ -199,25 +260,18 @@ export async function updateDeckInfo(
   return { success: true };
 }
 
-// 5. Hàm Xóa Bộ từ vựng
+// 5. Xóa Bộ từ vựng
 export async function deleteDeck(deckId: string) {
   const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
   await supabase.from('cards').delete().eq('deck_id', deckId);
+  const { error } = await supabase.from('decks').delete().eq('id', deckId).eq('user_id', user.id);
 
-  const { error } = await supabase
-    .from('decks')
-    .delete()
-    .eq('id', deckId)
-    .eq('user_id', user.id);
-
-  if (error) {
-    console.error('Lỗi xóa bộ từ vựng:', error);
-    return { success: false, error: 'Không thể xóa bộ từ vựng.' };
-  }
+  if (error) return { success: false, error: 'Không thể xóa bộ từ vựng.' };
 
   revalidatePath('/teacher');
   revalidatePath('/teacher/courses');
@@ -226,28 +280,27 @@ export async function deleteDeck(deckId: string) {
   return { success: true };
 }
 
-// 6. Hàm Thêm 1 thẻ từ vựng lẻ vào Bộ từ vựng
-export async function addCardToDeck(deckId: string, card: { term: string; phonetic: string; definition: string; example: string }) {
+// 6. Thêm 1 thẻ từ vựng
+export async function addCardToDeck(
+  deckId: string,
+  card: { term: string; phonetic: string; definition: string; example: string }
+) {
   const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
-  const { error } = await supabase
-    .from('cards')
-    .insert({
-      deck_id: deckId,
-      user_id: user.id,
-      term: card.term,
-      phonetic: card.phonetic,
-      definition: card.definition,
-      example: card.example
-    });
+  const { error } = await supabase.from('cards').insert({
+    deck_id: deckId,
+    user_id: user.id,
+    term: card.term,
+    phonetic: card.phonetic,
+    definition: card.definition,
+    example: card.example,
+  });
 
-  if (error) {
-    console.error('Lỗi thêm thẻ:', error);
-    return { success: false, error: 'Không thể thêm từ vựng mới.' };
-  }
+  if (error) return { success: false, error: 'Không thể thêm từ vựng mới.' };
 
   revalidatePath(`/teacher/decks/${deckId}`);
   revalidatePath('/teacher');
@@ -255,15 +308,16 @@ export async function addCardToDeck(deckId: string, card: { term: string; phonet
   return { success: true };
 }
 
-// 7. Hàm Chỉnh sửa nội dung 1 thẻ từ vựng
+// 7. Chỉnh sửa 1 thẻ từ vựng
 export async function updateCard(
   cardId: string,
   deckId: string,
   card: { term: string; phonetic: string; definition: string; example: string }
 ) {
   const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
   const { error } = await supabase
@@ -272,36 +326,27 @@ export async function updateCard(
       term: card.term,
       phonetic: card.phonetic,
       definition: card.definition,
-      example: card.example
+      example: card.example,
     })
     .eq('id', cardId);
 
-  if (error) {
-    console.error('Lỗi cập nhật thẻ:', error);
-    return { success: false, error: 'Không thể lưu thay đổi cho từ vựng này.' };
-  }
+  if (error) return { success: false, error: 'Không thể lưu thay đổi cho từ vựng này.' };
 
   revalidatePath(`/teacher/decks/${deckId}`);
   revalidatePath(`/student/decks/${deckId}`);
   return { success: true };
 }
 
-// 8. Hàm Xóa 1 thẻ từ vựng lẻ
+// 8. Xóa 1 thẻ từ vựng
 export async function deleteCard(cardId: string, deckId: string) {
   const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
-  const { error } = await supabase
-    .from('cards')
-    .delete()
-    .eq('id', cardId);
-
-  if (error) {
-    console.error('Lỗi xóa thẻ:', error);
-    return { success: false, error: 'Không thể xóa từ vựng này.' };
-  }
+  const { error } = await supabase.from('cards').delete().eq('id', cardId);
+  if (error) return { success: false, error: 'Không thể xóa từ vựng này.' };
 
   revalidatePath(`/teacher/decks/${deckId}`);
   revalidatePath('/teacher');
@@ -309,53 +354,42 @@ export async function deleteCard(cardId: string, deckId: string) {
   return { success: true };
 }
 
-// 9. Hàm tạo Khóa học mới
+// 9. Tạo Khóa học (Lớp học)
 export async function createNewCourse(title: string, description: string) {
   const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) {
-    return { success: false, error: 'Bạn chưa đăng nhập!' };
-  }
+  const { error } = await supabase.from('courses').insert({
+    title,
+    description,
+    teacher_id: user.id,
+  });
 
-  const { error } = await supabase
-    .from('courses')
-    .insert({
-      title: title,
-      description: description,
-      teacher_id: user.id
-    });
-
-  if (error) {
-    console.error('Lỗi tạo khóa học:', error);
-    return { success: false, error: 'Không thể tạo khóa học' };
-  }
+  if (error) return { success: false, error: 'Không thể tạo khóa học' };
 
   revalidatePath('/teacher/courses');
   revalidatePath('/student/explore');
   return { success: true };
 }
 
-// 10. Hàm Chỉnh sửa thông tin Khóa học
+// 10. Sửa Khóa học
 export async function updateCourse(courseId: string, title: string, description: string) {
   const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
   const { error } = await supabase
     .from('courses')
-    .update({
-      title: title,
-      description: description
-    })
+    .update({ title, description })
     .eq('id', courseId)
     .eq('teacher_id', user.id);
 
-  if (error) {
-    console.error('Lỗi cập nhật khóa học:', error);
-    return { success: false, error: 'Không thể cập nhật khóa học.' };
-  }
+  if (error) return { success: false, error: 'Không thể cập nhật khóa học.' };
 
   revalidatePath(`/teacher/courses/${courseId}`);
   revalidatePath('/teacher/courses');
@@ -363,11 +397,12 @@ export async function updateCourse(courseId: string, title: string, description:
   return { success: true };
 }
 
-// 11. Hàm Xóa Khóa học
+// 11. Xóa Khóa học
 export async function deleteCourse(courseId: string) {
   const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
   const { error } = await supabase
@@ -376,10 +411,7 @@ export async function deleteCourse(courseId: string) {
     .eq('id', courseId)
     .eq('teacher_id', user.id);
 
-  if (error) {
-    console.error('Lỗi xóa khóa học:', error);
-    return { success: false, error: 'Không thể xóa khóa học này.' };
-  }
+  if (error) return { success: false, error: 'Không thể xóa khóa học này.' };
 
   revalidatePath('/teacher/courses');
   revalidatePath('/teacher');
@@ -387,29 +419,202 @@ export async function deleteCourse(courseId: string) {
   return { success: true };
 }
 
-// 12. Hàm Đăng ký Khóa học (dành cho Học viên)
+// 12. Đăng ký Khóa học
 export async function enrollInCourse(courseId: string) {
   const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Bạn chưa đăng nhập!' };
 
-  const { error } = await supabase
-    .from('enrollments')
-    .insert({
-      course_id: courseId,
-      student_id: user.id
-    });
+  const { error } = await supabase.from('enrollments').insert({
+    course_id: courseId,
+    student_id: user.id,
+  });
 
   if (error) {
     if (error.code === '23505') {
       return { success: false, error: 'Bạn đã tham gia khóa học này rồi!' };
     }
-    console.error('Lỗi đăng ký khóa học:', error);
     return { success: false, error: 'Không thể đăng ký tham gia.' };
   }
 
   revalidatePath('/student/explore');
   revalidatePath('/student');
   return { success: true };
+}
+
+// 13. GIẢNG VIÊN GIAO BÀI TẬP (Tự động chốt Snapshot danh sách thẻ tại thời điểm giao)
+export async function createAssignmentWithSnapshot(payload: {
+  courseId: string;
+  deckId: string;
+  title: string;
+  description?: string;
+  dueAt: string;
+}) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Chưa đăng nhập!' };
+
+  // Kiểm tra quyền sở hữu lớp của giảng viên
+  const { data: course } = await supabase
+    .from('courses')
+    .select('id, teacher_id')
+    .eq('id', payload.courseId)
+    .eq('teacher_id', user.id)
+    .maybeSingle();
+
+  if (!course) {
+    return { success: false, error: 'Bạn không có quyền giao bài cho lớp này!' };
+  }
+
+  // Lấy danh sách ID thẻ tại đúng thời điểm giao (Snapshot)
+  const { data: deckCards } = await supabase
+    .from('cards')
+    .select('id')
+    .eq('deck_id', payload.deckId);
+
+  const snapshotCardIds = (deckCards || []).map((c) => c.id);
+  if (snapshotCardIds.length === 0) {
+    return { success: false, error: 'Bộ thẻ được chọn chưa có từ vựng nào!' };
+  }
+
+  const { error } = await supabase.from('assignments').insert({
+    course_id: payload.courseId,
+    deck_id: payload.deckId,
+    teacher_id: user.id,
+    title: payload.title,
+    description: payload.description || '',
+    due_at: new Date(payload.dueAt).toISOString(),
+    snapshot_card_ids: snapshotCardIds,
+  });
+
+  if (error) return { success: false, error: 'Không thể tạo bài giao.' };
+
+  revalidatePath('/teacher/analytics');
+  return { success: true };
+}
+
+// 14. GIẢNG VIÊN TẠO BÀI KIỂM TRA TRẮC NGHIỆM TỪ BỘ THẺ (Có Snapshot câu hỏi)
+export async function createQuizFromDeck(payload: {
+  courseId: string;
+  deckId: string;
+  title: string;
+  timeLimitSec?: number;
+}) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Chưa đăng nhập!' };
+
+  const { data: course } = await supabase
+    .from('courses')
+    .select('id, teacher_id')
+    .eq('id', payload.courseId)
+    .eq('teacher_id', user.id)
+    .maybeSingle();
+
+  if (!course) {
+    return { success: false, error: 'Bạn không có quyền tạo bài kiểm tra cho lớp này!' };
+  }
+
+  const { data: cards } = await supabase
+    .from('cards')
+    .select('id, term, definition')
+    .eq('deck_id', payload.deckId);
+
+  if (!cards || cards.length < 2) {
+    return { success: false, error: 'Bộ từ vựng cần tối thiểu 2 thẻ để tạo đề kiểm tra!' };
+  }
+
+  // Tạo Snapshot câu hỏi trắc nghiệm từ danh sách thẻ tại thời điểm tạo
+  const snapshotQuestions = cards.map((card) => {
+    const distractors = cards
+      .filter((other) => other.id !== card.id)
+      .slice(0, 3)
+      .map((d) => d.definition);
+    const options = Array.from(new Set([card.definition, ...distractors])).sort();
+    return {
+      card_id: card.id,
+      term: card.term,
+      correct_definition: card.definition,
+      options,
+    };
+  });
+
+  const { error } = await supabase.from('quizzes').insert({
+    course_id: payload.courseId,
+    deck_id: payload.deckId,
+    teacher_id: user.id,
+    title: payload.title,
+    time_limit_sec: payload.timeLimitSec || 600,
+    snapshot_questions: snapshotQuestions,
+  });
+
+  if (error) return { success: false, error: 'Không thể tạo bài kiểm tra.' };
+
+  revalidatePath('/teacher/analytics');
+  return { success: true };
+}
+
+// 15. HỌC VIÊN NỘP BÀI KIỂM TRA
+export async function submitQuizAttempt(payload: {
+  quizId: string;
+  answers: { card_id: string; selected: string }[];
+  durationSec: number;
+}) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Chưa đăng nhập!' };
+
+  const { data: quiz } = await supabase
+    .from('quizzes')
+    .select('id, course_id, snapshot_questions')
+    .eq('id', payload.quizId)
+    .single();
+
+  if (!quiz) return { success: false, error: 'Không tìm thấy bài kiểm tra!' };
+
+  const questions: any[] = Array.isArray(quiz.snapshot_questions) ? quiz.snapshot_questions : [];
+  let correctCount = 0;
+
+  const gradedAnswers = questions.map((q) => {
+    const found = payload.answers.find((a) => a.card_id === q.card_id);
+    const selected = found?.selected || '';
+    const isCorrect = selected === q.correct_definition;
+    if (isCorrect) correctCount += 1;
+    return {
+      card_id: q.card_id,
+      term: q.term,
+      selected,
+      correct_definition: q.correct_definition,
+      is_correct: isCorrect,
+    };
+  });
+
+  const totalQuestions = Math.max(1, questions.length);
+  const score = Math.round((correctCount / totalQuestions) * 100) / 10; // Thang điểm 10
+
+  const { error } = await supabase.from('quiz_attempts').insert({
+    quiz_id: quiz.id,
+    course_id: quiz.course_id,
+    user_id: user.id,
+    score,
+    correct_count: correctCount,
+    total_questions: totalQuestions,
+    answers: gradedAnswers,
+    duration_sec: payload.durationSec,
+    submitted_at: new Date().toISOString(),
+  });
+
+  if (error) return { success: false, error: 'Không thể nộp bài kiểm tra.' };
+
+  revalidatePath('/student');
+  revalidatePath('/teacher/analytics');
+  return { success: true, score, correctCount, totalQuestions };
 }
