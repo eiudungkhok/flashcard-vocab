@@ -23,6 +23,7 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
   const activeDeckIdRef = useRef<string | null>(null);
   const visitIdRef = useRef<string | null>(null);
   const lastRecordedPathRef = useRef<string>('');
+  const hasSyncedLocalRef = useRef<boolean>(false);
 
   const recordStudyInteraction = useCallback((deckId?: string) => {
     const now = Date.now();
@@ -31,7 +32,49 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
     if (deckId) activeDeckIdRef.current = deckId;
   }, []);
 
-  // Lắng nghe tương tác thật trên trang (chuột, bàn phím, chạm, cuộn) để phân biệt Active vs Idle
+  // 1. Đồng bộ ngay số giây đã có trong localStorage (VD: 1 phút 17 giây) lên Database cho Giảng viên thấy ngay
+  useEffect(() => {
+    if (hasSyncedLocalRef.current) return;
+    hasSyncedLocalRef.current = true;
+
+    try {
+      const savedVisit = sessionStorage.getItem('flashlearn_visit_id');
+      if (savedVisit) visitIdRef.current = savedVisit;
+
+      const raw = localStorage.getItem('flashlearn_telemetry_stats');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const totalSec = Number(parsed.totalSec || 0);
+        const studySec = Number(parsed.studySec || 0);
+        if (totalSec > 0) {
+          fetch('/api/telemetry', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              eventType: 'sync_local',
+              path: pathname || '/student',
+              visitId: visitIdRef.current,
+              totalSec,
+              studySec,
+              rawStart: Date.now() - Math.min(totalSec, 30) * 1000,
+              rawEnd: Date.now(),
+            }),
+            keepalive: true,
+          })
+            .then((r) => r.json())
+            .then((res) => {
+              if (res?.visitId) {
+                visitIdRef.current = res.visitId;
+                sessionStorage.setItem('flashlearn_visit_id', res.visitId);
+              }
+            })
+            .catch(() => {});
+        }
+      }
+    } catch {}
+  }, [pathname]);
+
+  // 2. Lắng nghe tương tác thật trên trang
   useEffect(() => {
     const onUserActivity = () => {
       lastUserActivityRef.current = Date.now();
@@ -42,12 +85,6 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
     window.addEventListener('touchstart', onUserActivity, { passive: true });
     window.addEventListener('scroll', onUserActivity, { passive: true });
 
-    // Khôi phục hoặc tạo visitId trong sessionStorage
-    try {
-      const savedVisit = sessionStorage.getItem('flashlearn_visit_id');
-      if (savedVisit) visitIdRef.current = savedVisit;
-    } catch {}
-
     return () => {
       window.removeEventListener('keydown', onUserActivity);
       window.removeEventListener('mousedown', onUserActivity);
@@ -56,7 +93,7 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
     };
   }, []);
 
-  // Ghi nhận lượt xem trang (Page View) khi đổi route (loại trừ API & static)
+  // 3. Ghi nhận lượt xem trang (Page View)
   useEffect(() => {
     if (!pathname || pathname.startsWith('/api') || pathname.startsWith('/_next')) return;
     if (lastRecordedPathRef.current === pathname) return;
@@ -86,7 +123,7 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
       .catch(() => {});
   }, [pathname]);
 
-  // Vòng lặp Heartbeat ghi nhận thời gian Truy cập (Presence), Hoạt động (Active) và Học (Study)
+  // 4. Vòng lặp Heartbeat định kỳ
   useEffect(() => {
     lastTickRef.current = Date.now();
 
@@ -109,10 +146,9 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
       const isActive =
         now - lastUserActivityRef.current <= TRACKING_CONFIG.IDLE_THRESHOLD_SEC * 1000;
       const isStudying =
-        pathname.includes('/study') &&
+        pathname.includes('/study') ||
         now - lastStudyInteractionRef.current <= TRACKING_CONFIG.STUDY_INTERACTION_WINDOW_SEC * 1000;
 
-      // 1. Cập nhật cache localStorage cho trang Học viên đọc tức thì
       try {
         const raw = localStorage.getItem('flashlearn_telemetry_stats');
         const current = raw
@@ -137,7 +173,6 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
         localStorage.setItem('flashlearn_telemetry_stats', JSON.stringify(updated));
       } catch {}
 
-      // 2. Đồng bộ về Server Database dùng chung cho cả Học viên & Giảng viên
       const payload = JSON.stringify({
         eventType: isUnloading ? 'unload' : 'heartbeat',
         visitId: visitIdRef.current,
@@ -172,10 +207,7 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
       }
     };
 
-    const timer = setInterval(
-      () => flushInterval(false),
-      TRACKING_CONFIG.HEARTBEAT_INTERVAL_SEC * 1000
-    );
+    const timer = setInterval(() => flushInterval(false), 10000);
 
     const onVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {

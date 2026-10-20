@@ -6,11 +6,7 @@ import * as XLSX from 'xlsx';
 import {
   Activity,
   Users,
-  BookOpen,
-  Clock,
   AlertTriangle,
-  CheckCircle2,
-  Download,
   FileSpreadsheet,
   FileText,
   Printer,
@@ -18,7 +14,6 @@ import {
   RefreshCw,
   Filter,
   Eye,
-  Calendar,
   Award,
   Layers,
   BarChart3,
@@ -29,54 +24,54 @@ import {
   ShieldCheck,
   Loader2,
 } from 'lucide-react';
-import { formatDurationVN } from '@/utils/analytics/timeEngine';
+import { formatDurationVN, toVNDateKey } from '@/utils/analytics/timeEngine';
 import {
   createAssignmentWithSnapshot,
   createQuizFromDeck,
+  getTeacherAnalyticsData,
+  getTeacherStudentDetailData,
 } from '@/app/actions/studyActions';
 
 type TabKey =
-  | 'traffic'      // Lưu lượng truy cập & Bảng học viên chi tiết
-  | 'matrix_chart' // GV3 Ma trận tiến độ & GV4 Biểu đồ lớp
-  | 'words_alert'  // GV5 Từ vựng khó & GV6 Phát hiện ít hoạt động
-  | 'assign_quiz'  // GV7 Bài được giao & GV8 Bài kiểm tra
-  | 'compare_rank';// GV9 So sánh lớp & GV10 Xếp hạng
+  | 'traffic'
+  | 'matrix_chart'
+  | 'words_alert'
+  | 'assign_quiz'
+  | 'compare_rank';
 
 export default function TeacherAnalyticsDashboard() {
   const [activeTab, setActiveTab] = useState<TabKey>('traffic');
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState<boolean>(true);
 
-  // Bộ lọc chuẩn
   const [scopeMode, setScopeMode] = useState<'class_learning' | 'website'>('class_learning');
   const [courseId, setCourseId] = useState<string>('all');
   const [deckId, setDeckId] = useState<string>('all');
-  const [assignmentId, setAssignmentId] = useState<string>('all');
+  const [assignmentId] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('all');
-  const [fromDate, setFromDate] = useState<string>(() => {
-    const d = new Date(Date.now() - 29 * 86400000);
-    return d.toISOString().slice(0, 10);
-  });
-  const [toDate, setToDate] = useState<string>(() => new Date().toISOString().slice(0, 10));
+
+  // Lấy ngày chuẩn theo múi giờ Việt Nam GMT+7 (Khắc phục lỗi lùi 1 ngày về 20/10 khi mở lúc 6h sáng 21/10)
+  const [fromDate, setFromDate] = useState<string>(() =>
+    toVNDateKey(Date.now() - 29 * 86400000)
+  );
+  const [toDate, setToDate] = useState<string>(() => toVNDateKey(Date.now()));
+
   const [granularity, setGranularity] = useState<'day' | 'week' | 'month'>('day');
   const [quizRule, setQuizRule] = useState<'highest' | 'latest' | 'first'>('highest');
   const [rankingMetric, setRankingMetric] = useState<'completion' | 'study_days' | 'quiz_score'>('completion');
   const [inactiveDays, setInactiveDays] = useState<number>(3);
   const [signalThresholdSec, setSignalThresholdSec] = useState<number>(60);
 
-  // Tìm kiếm, sắp xếp, phân trang phía Server cho bảng Lưu lượng học viên
   const [search, setSearch] = useState<string>('');
   const [sortBy, setSortBy] = useState<string>('lastSeenAt');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   const [page, setPage] = useState<number>(1);
   const [pageSize] = useState<number>(10);
 
-  // Modal Chi tiết 1 học viên (GV2 + Mục 4)
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
   const [studentDetail, setStudentDetail] = useState<any>(null);
   const [loadingDetail, setLoadingDetail] = useState<boolean>(false);
 
-  // Modal Giao bài mới (GV7) & Tạo bài kiểm tra (GV8)
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [assignForm, setAssignForm] = useState({
     courseId: '',
@@ -93,7 +88,7 @@ export default function TeacherAnalyticsDashboard() {
 
   const fetchDashboard = useCallback(async () => {
     try {
-      const params = new URLSearchParams({
+      const res = await getTeacherAnalyticsData({
         scopeMode,
         courseId,
         deckId,
@@ -104,21 +99,17 @@ export default function TeacherAnalyticsDashboard() {
         granularity,
         quizRule,
         rankingMetric,
-        inactiveDays: String(inactiveDays),
-        signalThresholdSec: String(signalThresholdSec),
+        inactiveDays,
+        signalThresholdSec,
         search,
         sortBy,
         sortOrder,
-        page: String(page),
-        pageSize: String(pageSize),
+        page,
+        pageSize,
       });
 
-      const res = await fetch(`/api/teacher/analytics?${params.toString()}`, {
-        cache: 'no-store',
-      });
-      if (res.ok) {
-        const json = await res.json();
-        setData(json);
+      if (res && !('error' in res)) {
+        setData(res);
       }
     } catch (e) {
       console.error('Lỗi tải thống kê giảng viên:', e);
@@ -145,31 +136,26 @@ export default function TeacherAnalyticsDashboard() {
     pageSize,
   ]);
 
-  // Tải lần đầu & Tự động cập nhật trạng thái mỗi 30 giây theo yêu cầu
   useEffect(() => {
     fetchDashboard();
     const timer = setInterval(fetchDashboard, 30000);
     return () => clearInterval(timer);
   }, [fetchDashboard]);
 
-  // Mở Modal Chi tiết học viên (GV2 & Mục 4)
   const openStudentModal = async (studentId: string) => {
     setSelectedStudentId(studentId);
     setLoadingDetail(true);
     setStudentDetail(null);
     try {
-      const res = await fetch(`/api/teacher/analytics/student/${studentId}`, {
-        cache: 'no-store',
-      });
-      if (res.ok) {
-        setStudentDetail(await res.json());
+      const res = await getTeacherStudentDetailData(studentId);
+      if (res && !('error' in res)) {
+        setStudentDetail(res);
       }
     } finally {
       setLoadingDetail(false);
     }
   };
 
-  // GV11: Xuất Báo cáo Excel / CSV / PDF khớp đúng số liệu Dashboard & Phạm vi quyền
   const handleExportReport = (format: 'xlsx' | 'csv' | 'pdf') => {
     if (!data) return;
 
@@ -215,7 +201,6 @@ export default function TeacherAnalyticsDashboard() {
       return;
     }
 
-    // Thêm các sheet GV5, GV7, GV9 vào file Excel
     const wsClassCompare = XLSX.utils.json_to_sheet(
       (data.gv9ClassComparison || []).map((c: any) => ({
         'Tên lớp': c.courseTitle,
@@ -339,7 +324,6 @@ export default function TeacherAnalyticsDashboard() {
             <span className="font-bold text-sm text-gray-800">Chế độ Phạm vi Số liệu:</span>
           </div>
 
-          {/* Tách bộ lọc "Hoạt động học của lớp" vs "Hoạt động trên website" */}
           <div className="inline-flex p-1 rounded-xl bg-gray-100 border border-gray-200">
             <button
               type="button"
@@ -353,7 +337,7 @@ export default function TeacherAnalyticsDashboard() {
                   : 'text-gray-600 hover:text-gray-900'
               }`}
             >
-              📚 Hoạt động học của lớp (Chỉ tính bộ thẻ thuộc lớp phụ trách)
+              📚 Hoạt động học của lớp (Tính trên các bộ thẻ của Giảng viên)
             </button>
             <button
               type="button"
@@ -403,7 +387,7 @@ export default function TeacherAnalyticsDashboard() {
               }}
               className="w-full px-3 py-2 border border-gray-300 rounded-xl text-xs font-semibold bg-white"
             >
-              <option value="all">Tất cả bộ thẻ lớp học</option>
+              <option value="all">Tất cả bộ thẻ ({data?.decks?.length || 0})</option>
               {(data?.decks || []).map((d: any) => (
                 <option key={d.id} value={d.id}>
                   {d.title}
@@ -536,23 +520,18 @@ export default function TeacherAnalyticsDashboard() {
         ))}
       </div>
 
-      {/* =====================================================================
-          TAB 1: KHU VỰC LƯU LƯỢNG TRUY CẬP HỌC VIÊN (MỤC 3 + MỤC 4 + GV2)
-         ===================================================================== */}
+      {/* TAB 1: KHU VỰC LƯU LƯỢNG TRUY CẬP HỌC VIÊN */}
       {activeTab === 'traffic' && (
         <div className="space-y-6">
-          {/* 10 Chỉ số tổng hợp Lưu lượng truy cập */}
           <div className="bg-slate-900 text-white p-6 rounded-3xl shadow-md space-y-4">
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-2">
-              <div>
-                <h3 className="text-lg font-extrabold flex items-center gap-2">
-                  <Activity size={20} className="text-teal-400" />
-                  Khu vực Lưu lượng truy cập & Thời gian sử dụng của Học viên
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Đã hợp nhất thời gian chồng lấn đa tab/thiết bị và loại trừ API, tài nguyên tĩnh, heartbeat khỏi lượt xem trang.
-                </p>
-              </div>
+            <div>
+              <h3 className="text-lg font-extrabold flex items-center gap-2">
+                <Activity size={20} className="text-teal-400" />
+                Khu vực Lưu lượng truy cập & Thời gian sử dụng của Học viên
+              </h3>
+              <p className="text-xs text-slate-400">
+                Đã hợp nhất thời gian chồng lấn đa tab/thiết bị và loại trừ API, tài nguyên tĩnh, heartbeat khỏi lượt xem trang.
+              </p>
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 pt-2">
@@ -599,7 +578,6 @@ export default function TeacherAnalyticsDashboard() {
             </div>
           </div>
 
-          {/* Bảng Lưu lượng & Học tập từng học viên (Đủ 13 cột chuẩn) */}
           <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
             <div className="p-4 bg-gray-50 border-b border-gray-200 flex flex-col md:flex-row justify-between items-start md:items-center gap-3">
               <div>
@@ -714,7 +692,6 @@ export default function TeacherAnalyticsDashboard() {
               </table>
             </div>
 
-            {/* Phân trang phía máy chủ */}
             <div className="p-4 bg-gray-50 border-t border-gray-200 flex items-center justify-between text-xs">
               <span className="text-gray-500 font-medium">
                 Trang {page} / {Math.max(1, Math.ceil((data?.trafficTable?.total || 0) / pageSize))} (Tổng{' '}
@@ -743,12 +720,9 @@ export default function TeacherAnalyticsDashboard() {
         </div>
       )}
 
-      {/* =====================================================================
-          TAB 2: GV3 (MA TRẬN TIẾN ĐỘ) & GV4 (BIỂU ĐỒ LỚP THEO NGÀY/TUẦN/THÁNG)
-         ===================================================================== */}
+      {/* TAB 2: GV3 & GV4 */}
       {activeTab === 'matrix_chart' && (
         <div className="space-y-8">
-          {/* GV4: Biểu đồ lớp */}
           <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm space-y-4">
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
               <div>
@@ -806,7 +780,6 @@ export default function TeacherAnalyticsDashboard() {
             )}
           </div>
 
-          {/* GV3: Bảng tiến độ Ma trận Học viên x Bộ thẻ được giao */}
           <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm space-y-4">
             <div>
               <h3 className="text-lg font-extrabold text-gray-900 flex items-center gap-2">
@@ -814,7 +787,7 @@ export default function TeacherAnalyticsDashboard() {
                 GV3 – Ma trận Tiến độ (Học viên × Bộ thẻ được giao)
               </h3>
               <p className="text-xs text-gray-500">
-                Tiến độ được tính bằng số thẻ KHÁC NHAU đã ôn / Tổng số thẻ của bộ bài (Không tính trùng khi lật 1 thẻ nhiều lần).
+                Tiến độ tính bằng số thẻ KHÁC NHAU đã ôn / Tổng số thẻ của bộ bài.
               </p>
             </div>
 
@@ -849,11 +822,6 @@ export default function TeacherAnalyticsDashboard() {
                                 ? '⏳ Đang học'
                                 : '⚪ Chưa bắt đầu'}
                             </span>
-                            <span className="text-[10px] text-gray-400">
-                              {cell.lastStudiedAt
-                                ? new Date(cell.lastStudiedAt).toLocaleDateString('vi-VN')
-                                : 'Chưa học'}
-                            </span>
                           </div>
                         </td>
                       ))}
@@ -866,19 +834,16 @@ export default function TeacherAnalyticsDashboard() {
         </div>
       )}
 
-      {/* =====================================================================
-          TAB 3: GV5 (TỪ VỰNG KHÓ) & GV6 (PHÁT HIỆN ÍT HOẠT ĐỘNG)
-         ===================================================================== */}
+      {/* TAB 3: GV5 & GV6 */}
       {activeTab === 'words_alert' && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          {/* GV5: Từ vựng khó */}
           <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm space-y-4">
             <div>
               <h3 className="text-lg font-extrabold text-gray-900">
                 GV5 – Xếp hạng Từ vựng khó trong lớp
               </h3>
               <p className="text-xs text-gray-500">
-                Xếp theo tỷ lệ đánh giá “Chưa nhớ” (Quên), hiển thị kèm số lượt đánh giá và số học viên đã ôn để tránh kết luận vội từ mẫu quá nhỏ.
+                Xếp theo tỷ lệ đánh giá “Chưa nhớ”, kèm số lượt đánh giá và số học viên đã ôn.
               </p>
             </div>
 
@@ -906,9 +871,6 @@ export default function TeacherAnalyticsDashboard() {
                           <span className="px-2.5 py-1 rounded-full font-bold bg-red-50 text-red-600">
                             {w.unrememberedRate}%
                           </span>
-                          {w.lowSampleWarning && (
-                            <p className="text-[10px] text-amber-600 mt-1">⚠️ Ít dữ liệu mẫu</p>
-                          )}
                         </td>
                         <td className="p-3 text-center font-semibold">{w.totalEvaluations}</td>
                         <td className="p-3 text-center font-semibold">{w.uniqueStudentsCount} HV</td>
@@ -917,7 +879,7 @@ export default function TeacherAnalyticsDashboard() {
                   ) : (
                     <tr>
                       <td colSpan={5} className="p-8 text-center text-gray-400">
-                        Chưa có dữ liệu đánh giá thẻ trong phạm vi lớp.
+                        Chưa có dữ liệu đánh giá thẻ.
                       </td>
                     </tr>
                   )}
@@ -926,7 +888,6 @@ export default function TeacherAnalyticsDashboard() {
             </div>
           </div>
 
-          {/* GV6: Phát hiện ít hoạt động */}
           <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm space-y-4">
             <div className="flex justify-between items-start gap-2">
               <div>
@@ -935,7 +896,7 @@ export default function TeacherAnalyticsDashboard() {
                   GV6 – Phát hiện Học viên ít hoạt động
                 </h3>
                 <p className="text-xs text-gray-500">
-                  Phân biệt rõ nhóm <strong>“Có truy cập nhưng chưa học”</strong> với nhóm <strong>“Không truy cập”</strong>
+                  Phân biệt rõ nhóm “Có truy cập nhưng chưa học” với nhóm “Không truy cập”
                 </p>
               </div>
               <div className="flex items-center gap-1.5 text-xs">
@@ -970,15 +931,7 @@ export default function TeacherAnalyticsDashboard() {
                           <p className="font-mono text-gray-500">{st.studentCode}</p>
                         </td>
                         <td className="p-3">
-                          <span
-                            className={`inline-block px-2.5 py-1 rounded-lg font-bold ${
-                              st.category === 'visited_but_never_studied'
-                                ? 'bg-purple-50 text-purple-700'
-                                : st.category === 'no_visit_in_days'
-                                ? 'bg-red-50 text-red-700'
-                                : 'bg-amber-50 text-amber-700'
-                            }`}
-                          >
+                          <span className="inline-block px-2.5 py-1 rounded-lg font-bold bg-amber-50 text-amber-700">
                             {st.reasonLabel}
                           </span>
                         </td>
@@ -1008,12 +961,9 @@ export default function TeacherAnalyticsDashboard() {
         </div>
       )}
 
-      {/* =====================================================================
-          TAB 4: GV7 (BÀI ĐƯỢC GIAO KÈM SNAPSHOT) & GV8 (BÀI KIỂM TRA)
-         ===================================================================== */}
+      {/* TAB 4: GV7 & GV8 */}
       {activeTab === 'assign_quiz' && (
         <div className="space-y-8">
-          {/* GV7: Bài được giao */}
           <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm space-y-4">
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
               <div>
@@ -1081,12 +1031,11 @@ export default function TeacherAnalyticsDashboard() {
             )}
           </div>
 
-          {/* GV8: Bài kiểm tra */}
           <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm space-y-4">
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
               <div>
                 <h3 className="text-lg font-extrabold text-gray-900">
-                  GV8 – Thống kê Bài kiểm tra (Tách biệt với tỷ lệ tự đánh giá nhớ thẻ)
+                  GV8 – Thống kê Bài kiểm tra
                 </h3>
                 <p className="text-xs text-gray-500">
                   Quy tắc lấy điểm đang áp dụng thống nhất: <strong>{quizRule === 'first' ? 'Lần làm đầu tiên' : quizRule === 'latest' ? 'Lần làm gần nhất' : 'Điểm cao nhất'}</strong>
@@ -1113,7 +1062,7 @@ export default function TeacherAnalyticsDashboard() {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
               <div className="p-4 rounded-xl bg-indigo-50 border border-indigo-100">
                 <p className="text-xs text-indigo-600 font-bold">Điểm trung bình</p>
                 <p className="text-2xl font-black text-indigo-900 mt-1">
@@ -1131,12 +1080,9 @@ export default function TeacherAnalyticsDashboard() {
         </div>
       )}
 
-      {/* =====================================================================
-          TAB 5: GV9 (SO SÁNH LỚP) & GV10 (XẾP HẠNG ĐƠN TIÊU CHÍ)
-         ===================================================================== */}
+      {/* TAB 5: GV9 & GV10 */}
       {activeTab === 'compare_rank' && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          {/* GV9: So sánh lớp */}
           <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm space-y-4">
             <div>
               <h3 className="text-lg font-extrabold text-gray-900">
@@ -1156,7 +1102,6 @@ export default function TeacherAnalyticsDashboard() {
                     <th className="p-3 text-center">Tỷ lệ tham gia</th>
                     <th className="p-3 text-center">Tiến độ TB</th>
                     <th className="p-3 text-center">TG học TB/HV</th>
-                    <th className="p-3 text-center">Điểm KT TB</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
@@ -1169,9 +1114,6 @@ export default function TeacherAnalyticsDashboard() {
                       <td className="p-3 text-center text-emerald-700 font-semibold">
                         {formatDurationVN(c.avgStudySec)}
                       </td>
-                      <td className="p-3 text-center font-bold">
-                        {c.avgQuizScore ?? 'Chưa có'}
-                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -1179,7 +1121,6 @@ export default function TeacherAnalyticsDashboard() {
             </div>
           </div>
 
-          {/* GV10: Bảng xếp hạng đơn tiêu chí */}
           <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm space-y-4">
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
               <div>
@@ -1188,7 +1129,7 @@ export default function TeacherAnalyticsDashboard() {
                   GV10 – Bảng xếp hạng Học viên
                 </h3>
                 <p className="text-xs text-gray-500">
-                  Giữ riêng từng tiêu chí độc lập; không tự chế điểm tổng hợp và không coi mở web lâu là học tốt.
+                  Giữ riêng từng tiêu chí độc lập; không coi mở web lâu là học tốt.
                 </p>
               </div>
               <select
@@ -1236,9 +1177,7 @@ export default function TeacherAnalyticsDashboard() {
         </div>
       )}
 
-      {/* =====================================================================
-          MODAL CHI TIẾT 1 HỌC VIÊN & LỊCH SỬ LƯỢT TRUY CẬP (GV2 + MỤC 4)
-         ===================================================================== */}
+      {/* MODAL CHI TIẾT 1 HỌC VIÊN (GV2 + MỤC 4) */}
       {selectedStudentId && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
           <div className="bg-white rounded-3xl max-w-5xl w-full max-h-[90vh] overflow-y-auto p-6 md:p-8 space-y-6 shadow-2xl">
@@ -1249,8 +1188,7 @@ export default function TeacherAnalyticsDashboard() {
                 </h2>
                 {studentDetail?.student && (
                   <p className="text-xs text-gray-500 mt-1">
-                    <strong>{studentDetail.student.fullName}</strong> ({studentDetail.student.studentCode}) • Lớp:{' '}
-                    {(studentDetail.student.classes || []).join(', ')} • Bật theo dõi từ:{' '}
+                    <strong>{studentDetail.student.fullName}</strong> ({studentDetail.student.studentCode}) • Bật theo dõi từ:{' '}
                     {studentDetail.student.trackingEnabledAt
                       ? new Date(studentDetail.student.trackingEnabledAt).toLocaleDateString('vi-VN')
                       : 'Chưa ghi nhận'}
@@ -1273,7 +1211,6 @@ export default function TeacherAnalyticsDashboard() {
               </div>
             ) : studentDetail ? (
               <div className="space-y-6">
-                {/* Thống kê tóm tắt của học viên */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                   <div className="p-4 rounded-2xl bg-blue-50">
                     <p className="text-xs font-bold text-blue-600">Chuỗi ngày học (Streak)</p>
@@ -1301,7 +1238,6 @@ export default function TeacherAnalyticsDashboard() {
                   </div>
                 </div>
 
-                {/* Lịch hoạt động theo khung giờ trong ngày (0h - 23h) */}
                 <div className="bg-gray-50 p-4 rounded-2xl border border-gray-200 space-y-2">
                   <h4 className="text-xs font-bold uppercase text-gray-700">
                     Lịch hoạt động theo khung giờ trong ngày (GMT+7)
@@ -1325,10 +1261,9 @@ export default function TeacherAnalyticsDashboard() {
                   </div>
                 </div>
 
-                {/* Danh sách từng lượt truy cập (Visits) */}
                 <div className="space-y-2">
                   <h4 className="font-bold text-sm text-gray-900">
-                    Danh sách các Lượt truy cập gần nhất (So sánh Thời gian truy cập vs Thời gian học)
+                    Danh sách các Lượt truy cập gần nhất
                   </h4>
                   <div className="overflow-x-auto border border-gray-200 rounded-2xl">
                     <table className="w-full text-left border-collapse text-xs">
@@ -1336,7 +1271,7 @@ export default function TeacherAnalyticsDashboard() {
                         <tr className="bg-gray-100 text-gray-600 border-b">
                           <th className="p-3">Bắt đầu</th>
                           <th className="p-3">Kết thúc / Ghi nhận cuối</th>
-                          <th className="p-3">Thiết bị / Trình duyệt</th>
+                          <th className="p-3">Thiết bị</th>
                           <th className="p-3">TG Truy cập</th>
                           <th className="p-3">TG Hoạt động</th>
                           <th className="p-3">TG Học</th>
@@ -1374,33 +1309,6 @@ export default function TeacherAnalyticsDashboard() {
                       </tbody>
                     </table>
                   </div>
-                </div>
-
-                {/* Từ vựng học viên này thường quên trong phạm vi lớp */}
-                <div className="space-y-2">
-                  <h4 className="font-bold text-sm text-gray-900">
-                    Những từ vựng học viên thường quên (Chỉ hiển thị trong phạm vi bộ thẻ của lớp)
-                  </h4>
-                  {(studentDetail.frequentlyForgottenWords || []).length > 0 ? (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      {studentDetail.frequentlyForgottenWords.map((fw: any) => (
-                        <div
-                          key={fw.cardId}
-                          className="p-3 rounded-xl border border-red-100 bg-red-50/40 flex justify-between items-center text-xs"
-                        >
-                          <div>
-                            <p className="font-bold text-gray-900">{fw.term} — {fw.definition}</p>
-                            <p className="text-gray-500">{fw.deckTitle}</p>
-                          </div>
-                          <span className="font-extrabold text-red-600">
-                            Quên {fw.forgotCount}/{fw.totalReviews} lần ({fw.forgotRate}%)
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-xs text-gray-400">Chưa ghi nhận từ vựng bị quên.</p>
-                  )}
                 </div>
               </div>
             ) : null}

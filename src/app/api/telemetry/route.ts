@@ -30,19 +30,10 @@ export async function POST(req: NextRequest) {
     const isStudying = Boolean(body.isStudying ?? false);
     const device = parseUserAgentSummary(req.headers.get('user-agent'));
 
-    const rawStart = Number(body.rawStart || body.startMs || now - 1000);
+    const rawStart = Number(body.rawStart || body.startMs || now - 5000);
     const rawEnd = Number(body.rawEnd || body.endMs || now);
 
-    const {
-      isValid,
-      startMs,
-      endMs,
-      rawDurationSec,
-      creditedDurationSec,
-      hasGap,
-    } = validateAndClampInterval(rawStart, rawEnd);
-
-    // 1. Tìm hoặc tạo Lượt truy cập (web_visits) trong vòng 30 phút gần nhất
+    // 1. Tìm hoặc tạo Lượt truy cập (web_visits)
     let visitId: string | null = body.visitId || null;
     const timeoutCutoff = new Date(now - TRACKING_CONFIG.VISIT_TIMEOUT_SEC * 1000).toISOString();
 
@@ -72,17 +63,22 @@ export async function POST(req: NextRequest) {
       if (recentVisit) {
         visitId = recentVisit.id;
       } else {
+        const initSec = Math.max(5, Number(body.totalSec || 0));
+        const initStudySec = Math.max(0, Number(body.studySec || 0));
         const { data: createdVisit } = await supabase
           .from('web_visits')
           .insert({
             user_id: user.id,
-            started_at: new Date(startMs || now).toISOString(),
+            started_at: new Date(now - initSec * 1000).toISOString(),
             last_seen_at: new Date(now).toISOString(),
             end_reason: 'active',
             device_summary: device,
             user_agent: req.headers.get('user-agent') || '',
             entry_path: path,
             page_views_count: 1,
+            presence_sec: initSec,
+            active_sec: initSec,
+            study_sec: initStudySec,
           })
           .select('id')
           .single();
@@ -91,7 +87,30 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 2. Nếu là sự kiện xem trang mới (loại trừ API, tài nguyên tĩnh và heartbeat)
+    // Đồng bộ thời gian localStorage nếu lượt truy cập vừa khởi tạo chưa có số giây
+    if (eventType === 'sync_local' && visitId) {
+      const localTotalSec = Math.max(0, Number(body.totalSec || 0));
+      const localStudySec = Math.max(0, Number(body.studySec || 0));
+      const { data: v } = await supabase
+        .from('web_visits')
+        .select('presence_sec, active_sec, study_sec')
+        .eq('id', visitId)
+        .maybeSingle();
+
+      if (v && Number(v.presence_sec || 0) < localTotalSec) {
+        await supabase
+          .from('web_visits')
+          .update({
+            last_seen_at: new Date(now).toISOString(),
+            presence_sec: localTotalSec,
+            active_sec: localTotalSec,
+            study_sec: Math.max(Number(v.study_sec || 0), localStudySec),
+          })
+          .eq('id', visitId);
+      }
+      return NextResponse.json({ ok: true, visitId, synced: true });
+    }
+
     if (eventType === 'pageview' && visitId && !path.startsWith('/api') && !path.startsWith('/_next')) {
       await supabase.from('page_views').insert({
         visit_id: visitId,
@@ -103,7 +122,7 @@ export async function POST(req: NextRequest) {
         .from('web_visits')
         .select('page_views_count')
         .eq('id', visitId)
-        .single();
+        .maybeSingle();
 
       await supabase
         .from('web_visits')
@@ -116,6 +135,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, visitId, eventType: 'pageview' });
     }
 
+    const {
+      isValid,
+      startMs,
+      endMs,
+      rawDurationSec,
+      creditedDurationSec,
+      hasGap,
+    } = validateAndClampInterval(rawStart, rawEnd);
+
     if (!isValid || creditedDurationSec <= 0) {
       return NextResponse.json({
         ok: true,
@@ -127,47 +155,36 @@ export async function POST(req: NextRequest) {
 
     const kind: IntervalKind = isStudying ? 'study' : isActive ? 'active' : 'presence';
 
-    // 3. Chống ghi trùng khoảng thời gian (Idempotency check)
-    const { data: duplicate } = await supabase
-      .from('telemetry_intervals')
-      .select('id')
-      .eq('user_id', user.id)
-      .eq('start_ms', startMs)
-      .eq('end_ms', endMs)
-      .maybeSingle();
+    await supabase.from('telemetry_intervals').insert({
+      visit_id: visitId,
+      user_id: user.id,
+      kind,
+      path,
+      deck_id: deckId,
+      start_ms: startMs,
+      end_ms: endMs,
+      credited_sec: creditedDurationSec,
+      device_summary: device,
+    });
 
-    if (!duplicate) {
-      await supabase.from('telemetry_intervals').insert({
-        visit_id: visitId,
-        user_id: user.id,
-        kind,
-        path,
-        deck_id: deckId,
-        start_ms: startMs,
-        end_ms: endMs,
-        credited_sec: creditedDurationSec,
-        device_summary: device,
-      });
+    if (visitId) {
+      const { data: currentVisit } = await supabase
+        .from('web_visits')
+        .select('presence_sec, active_sec, study_sec')
+        .eq('id', visitId)
+        .maybeSingle();
 
-      if (visitId) {
-        const { data: currentVisit } = await supabase
-          .from('web_visits')
-          .select('presence_sec, active_sec, study_sec')
-          .eq('id', visitId)
-          .single();
-
-        await supabase
-          .from('web_visits')
-          .update({
-            last_seen_at: new Date(now).toISOString(),
-            ended_at: eventType === 'unload' ? new Date(now).toISOString() : null,
-            end_reason: eventType === 'unload' ? 'closed' : isActive ? 'active' : 'idle_timeout',
-            presence_sec: (currentVisit?.presence_sec || 0) + creditedDurationSec,
-            active_sec: (currentVisit?.active_sec || 0) + (isActive ? creditedDurationSec : 0),
-            study_sec: (currentVisit?.study_sec || 0) + (isStudying ? creditedDurationSec : 0),
-          })
-          .eq('id', visitId);
-      }
+      await supabase
+        .from('web_visits')
+        .update({
+          last_seen_at: new Date(now).toISOString(),
+          ended_at: eventType === 'unload' ? new Date(now).toISOString() : null,
+          end_reason: eventType === 'unload' ? 'closed' : isActive ? 'active' : 'idle_timeout',
+          presence_sec: (currentVisit?.presence_sec || 0) + creditedDurationSec,
+          active_sec: (currentVisit?.active_sec || 0) + (isActive ? creditedDurationSec : 0),
+          study_sec: (currentVisit?.study_sec || 0) + (isStudying ? creditedDurationSec : 0),
+        })
+        .eq('id', visitId);
     }
 
     return NextResponse.json({
