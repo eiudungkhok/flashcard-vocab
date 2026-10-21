@@ -659,7 +659,7 @@ export async function getTeacherAnalyticsData(params: {
   const fromMs = new Date(fromIso).getTime();
   const toMs = new Date(toIso).getTime();
 
-  // 1. Lấy danh sách lớp (courses) của giảng viên VÀ các bộ thẻ do giảng viên tạo (bao gồm cả bộ thẻ tự do như Esport)
+  // 1. Lấy danh sách lớp (courses) của giảng viên VÀ các bộ thẻ do giảng viên tạo
   const { data: realCoursesData } = await supabase
     .from('courses')
     .select('id, title, description, created_at')
@@ -669,7 +669,6 @@ export async function getTeacherAnalyticsData(params: {
   const realCourses = realCoursesData || [];
   const realCourseIds = realCourses.map((c) => c.id);
 
-  // Lấy toàn bộ bộ thẻ thuộc khóa học của giảng viên HOẶC do chính giảng viên này biên soạn
   const deckOrParts: string[] = [`user_id.eq.${user.id}`];
   if (realCourseIds.length > 0) {
     deckOrParts.push(`course_id.in.(${realCourseIds.join(',')})`);
@@ -694,22 +693,23 @@ export async function getTeacherAnalyticsData(params: {
     });
   }
 
-  // Lọc bộ thẻ theo lớp được chọn
-  let assignedDecks = allTeacherDecks.filter((d) => {
+  // Các bộ thẻ thuộc lớp đang chọn (để hiển thị trong dropdown Bộ thẻ)
+  const decksForDropdown = allTeacherDecks.filter((d) => {
     if (courseFilter === 'all') return true;
     if (courseFilter === 'free_decks') return !d.course_id;
     return d.course_id === courseFilter;
   });
 
-  if (deckFilter !== 'all') {
-    assignedDecks = assignedDecks.filter((d) => d.id === deckFilter);
-  }
+  // Các bộ thẻ áp dụng cho tính toán
+  const assignedDecks =
+    deckFilter === 'all'
+      ? decksForDropdown
+      : decksForDropdown.filter((d) => d.id === deckFilter);
 
   const allowedDeckIds = assignedDecks.map((d) => d.id);
   const allTeacherDeckIds = allTeacherDecks.map((d) => d.id);
 
-  // 2. Lấy danh sách học viên thuộc phạm vi:
-  // Gồm: Học viên ghi danh trong enrollments + Học viên đã học bộ thẻ của giảng viên trong card_progress
+  // 2. Lấy danh sách học viên
   const { data: enrollmentsData } =
     realCourseIds.length > 0
       ? await supabase
@@ -730,7 +730,6 @@ export async function getTeacherAnalyticsData(params: {
 
   const teacherDeckProgress = allProgressOnTeacherDecks || [];
 
-  // Map học viên vào từng lớp (bao gồm cả lớp tự do nếu học bộ thẻ tự do của GV)
   const courseTitleMap = new Map(virtualCourses.map((c) => [c.id, c.title]));
   const deckToCourseMap = new Map(
     allTeacherDecks.map((d) => [d.id, d.course_id || 'free_decks'])
@@ -753,24 +752,22 @@ export async function getTeacherAnalyticsData(params: {
     studentCourseIdsMap.get(cp.user_id)!.add(cId);
   });
 
-  // Lấy thêm danh sách học viên từ bảng profiles để không bỏ sót học viên đã tạo tài khoản nhưng chưa bấm học
   const { data: allStudentProfiles } = await supabase
     .from('profiles')
     .select('id, email, full_name, role, student_code, tracking_enabled_at, created_at')
     .eq('role', 'student');
 
   (allStudentProfiles || []).forEach((p) => {
-    if (!studentCourseIdsMap.has(p.id) && hasFreeDecks) {
-      studentCourseIdsMap.set(p.id, new Set(['free_decks']));
+    if (!studentCourseIdsMap.has(p.id)) {
+      const defaultSet = new Set<string>();
+      if (hasFreeDecks) defaultSet.add('free_decks');
+      realCourseIds.forEach((rc) => defaultSet.add(rc));
+      studentCourseIdsMap.set(p.id, defaultSet);
     }
   });
 
-  // Lọc danh sách học viên duy nhất theo courseFilter
   const uniqueStudentIds = Array.from(studentCourseIdsMap.entries())
-    .filter(([studentId, cSet]) => {
-      if (studentId === user.id && (allStudentProfiles || []).length > 0) {
-        // Nếu giảng viên có tài khoản học viên riêng thì ưu tiên hiển thị học viên, nhưng nếu tự test trên cùng tài khoản vẫn hiển thị
-      }
+    .filter(([, cSet]) => {
       if (courseFilter === 'all') return true;
       return cSet.has(courseFilter);
     })
@@ -786,7 +783,7 @@ export async function getTeacherAnalyticsData(params: {
 
   const profileMap = new Map((profilesData || []).map((p) => [p.id, p]));
 
-  // 3. Truy vấn dữ liệu Telemetry & Kết quả học tập
+  // 3. Truy vấn dữ liệu Telemetry & Học tập
   const [
     visitsRes,
     intervalsRes,
@@ -870,12 +867,13 @@ export async function getTeacherAnalyticsData(params: {
     (pv) => !pv.path.startsWith('/api') && !pv.path.startsWith('/_next')
   );
 
+  // Nếu học viên đang học bộ thẻ của GV nhưng GV chọn lọc 1 bộ thẻ khác chưa có lượt học, vẫn cho phép tính tiến độ đúng
   const cardProgressList = teacherDeckProgress.filter((cp) =>
     allowedDeckIds.includes(cp.deck_id)
   );
 
-  // Tự động quy đổi dữ liệu lịch sử từ card_progress (ví dụ 50 từ bộ Esport đã học trước khi tạo bảng review_logs)
-  const rawReviews = (reviewsRes.data || []).filter((r) =>
+  const allRawReviews = reviewsRes.data || [];
+  const rawReviews = allRawReviews.filter((r) =>
     scopeMode === 'class_learning' ? allowedDeckIds.includes(r.deck_id) : true
   );
 
@@ -904,7 +902,8 @@ export async function getTeacherAnalyticsData(params: {
 
   const reviews = [...rawReviews, ...fallbackReviewsFromProgress];
 
-  const sessions = (sessionsRes.data || []).filter((s) =>
+  const allSessions = sessionsRes.data || [];
+  const sessions = allSessions.filter((s) =>
     scopeMode === 'class_learning' ? allowedDeckIds.includes(s.deck_id) : true
   );
 
@@ -912,27 +911,31 @@ export async function getTeacherAnalyticsData(params: {
   const quizzes = quizzesRes.data || [];
   const quizAttempts = quizAttemptsRes.data || [];
 
-  // 4. Tính toán chỉ số từng học viên
+  // 4. Tính toán chỉ số từng học viên (Bắt chính xác tín hiệu Đang học từ cả Heartbeat /study, PageView /study, Session và Review)
   const studentMetricsList = uniqueStudentIds.map((studentId) => {
     const profile = profileMap.get(studentId);
     const studentVisits = visits.filter((v) => v.user_id === studentId);
     const studentIntervals = rawIntervals.filter((i) => i.user_id === studentId);
+    const studentPageViews = pageViews.filter((pv) => pv.user_id === studentId);
     const studentSessions = sessions.filter((s) => s.user_id === studentId);
     const studentReviews = reviews.filter((r) => r.user_id === studentId);
     const studentProgress = cardProgressList.filter((cp) => cp.user_id === studentId);
+
+    // Các khoảng thời gian học (gồm kind === 'study' hoặc đang ở đường dẫn '/study')
+    const studyIntervals = studentIntervals.filter(
+      (i) => i.kind === 'study' || (i.path && i.path.includes('/study'))
+    );
 
     const presenceMerged = mergeOverlappingIntervals(
       studentIntervals.map((i) => ({ startMs: Number(i.start_ms), endMs: Number(i.end_ms) }))
     );
     const activeMerged = mergeOverlappingIntervals(
       studentIntervals
-        .filter((i) => i.kind === 'active' || i.kind === 'study')
+        .filter((i) => i.kind === 'active' || i.kind === 'study' || (i.path && i.path.includes('/study')))
         .map((i) => ({ startMs: Number(i.start_ms), endMs: Number(i.end_ms) }))
     );
     const studyMerged = mergeOverlappingIntervals(
-      studentIntervals
-        .filter((i) => i.kind === 'study')
-        .map((i) => ({ startMs: Number(i.start_ms), endMs: Number(i.end_ms) }))
+      studyIntervals.map((i) => ({ startMs: Number(i.start_ms), endMs: Number(i.end_ms) }))
     );
 
     const sessionDurationSum = studentSessions.reduce(
@@ -952,9 +955,8 @@ export async function getTeacherAnalyticsData(params: {
       0
     );
 
-    // Nếu học viên đã có lượt ôn trong card_progress (VD: 50 từ) nhưng bảng telemetry mới tạo chưa kịp ghi giây, ước tính tối thiểu từ các lượt lật thẻ hợp lệ
     const fallbackStudySec =
-      studentReviews.length > 0 ? Math.max(visitStudySum, studentReviews.length * 3) : 0;
+      studentReviews.length > 0 ? Math.max(visitStudySum, studentReviews.length * 3) : visitStudySum;
 
     const studySec = Math.max(studyMerged.totalSeconds, sessionDurationSum, fallbackStudySec);
     const activeSec = Math.max(activeMerged.totalSeconds, visitActiveSum, studySec);
@@ -967,24 +969,51 @@ export async function getTeacherAnalyticsData(params: {
     const studyDaySet = new Set<string>();
     studentReviews.forEach((r) => studyDaySet.add(toVNDateKey(r.reviewed_at)));
     studentSessions.forEach((s) => studyDaySet.add(toVNDateKey(s.started_at)));
+    studyIntervals.forEach((i) => studyDaySet.add(toVNDateKey(Number(i.end_ms))));
 
-    const latestReviewAt =
-      studentReviews.length > 0
-        ? studentReviews.reduce(
-            (latest, r) => (r.reviewed_at > latest ? r.reviewed_at : latest),
-            studentReviews[0].reviewed_at
-          )
-        : null;
+    // Tìm mốc thời gian Học gần nhất từ TẤT CẢ các nguồn hợp lệ:
+    // 1. Lượt lật thẻ đánh giá SRS (review_logs / card_progress)
+    // 2. Nhịp Heartbeat tại màn hình /student/study (telemetry_intervals)
+    // 3. Lượt mở trang /student/study (page_views)
+    // 4. Buổi học (study_sessions)
+    const candidateStudyTimestamps: number[] = [];
 
-    const lastSeenAt =
-      studentVisits.length > 0
-        ? studentVisits.reduce(
-            (latest, v) => (v.last_seen_at > latest ? v.last_seen_at : latest),
-            studentVisits[0].last_seen_at
-          )
-        : latestReviewAt;
+    // Lấy cả review trên toàn bộ thẻ của GV để không bị mất tín hiệu "Đang học" khi GV đang lọc dropdown bộ thẻ khác
+    allRawReviews
+      .filter((r) => r.user_id === studentId)
+      .forEach((r) => candidateStudyTimestamps.push(new Date(r.reviewed_at).getTime()));
 
-    const lastStudyAt = latestReviewAt;
+    teacherDeckProgress
+      .filter((cp) => cp.user_id === studentId && cp.updated_at)
+      .forEach((cp) => candidateStudyTimestamps.push(new Date(cp.updated_at).getTime()));
+
+    allSessions
+      .filter((s) => s.user_id === studentId && s.last_interaction_at)
+      .forEach((s) => candidateStudyTimestamps.push(new Date(s.last_interaction_at).getTime()));
+
+    studyIntervals.forEach((i) => candidateStudyTimestamps.push(Number(i.end_ms)));
+
+    studentPageViews
+      .filter((pv) => pv.path && pv.path.includes('/study'))
+      .forEach((pv) => candidateStudyTimestamps.push(new Date(pv.created_at).getTime()));
+
+    const maxStudyMs =
+      candidateStudyTimestamps.length > 0 ? Math.max(...candidateStudyTimestamps) : 0;
+    const lastStudyAt = maxStudyMs > 0 ? new Date(maxStudyMs).toISOString() : null;
+
+    // Tìm mốc thời gian Truy cập / Hoạt động gần nhất
+    const candidateSeenTimestamps: number[] = [...candidateStudyTimestamps];
+    studentVisits.forEach((v) =>
+      candidateSeenTimestamps.push(new Date(v.last_seen_at).getTime())
+    );
+    studentIntervals.forEach((i) => candidateSeenTimestamps.push(Number(i.end_ms)));
+    studentPageViews.forEach((pv) =>
+      candidateSeenTimestamps.push(new Date(pv.created_at).getTime())
+    );
+
+    const maxSeenMs =
+      candidateSeenTimestamps.length > 0 ? Math.max(...candidateSeenTimestamps) : 0;
+    const lastSeenAt = maxSeenMs > 0 ? new Date(maxSeenMs).toISOString() : null;
 
     const realtime = resolveStudentRealtimeStatus({
       lastSeenAt,
@@ -1015,6 +1044,11 @@ export async function getTeacherAnalyticsData(params: {
       studyDaySet.size > 0 ? studyDaySet.size : 0
     );
 
+    const totalStudentReviews = Math.max(
+      studentReviews.length,
+      distinctReviewedCards
+    );
+
     return {
       studentId,
       fullName:
@@ -1033,7 +1067,7 @@ export async function getTeacherAnalyticsData(params: {
       activeSec,
       studySec,
       sessionsCount: effectiveSessionsCount,
-      reviewsCount: studentReviews.length,
+      reviewsCount: totalStudentReviews,
       distinctReviewedCards,
       totalAssignedCards,
       completionPct,
@@ -1050,7 +1084,7 @@ export async function getTeacherAnalyticsData(params: {
     (s) => s.visitsCount > 0 || s.presenceSec > 0
   ).length;
   const studiedStudents = studentMetricsList.filter(
-    (s) => s.reviewsCount > 0 || s.sessionsCount > 0
+    (s) => s.reviewsCount > 0 || s.sessionsCount > 0 || s.studySec > 0
   ).length;
   const notStudiedStudents = Math.max(0, totalStudents - studiedStudents);
   const totalReviews = studentMetricsList.reduce((acc, s) => acc + s.reviewsCount, 0);
@@ -1087,7 +1121,10 @@ export async function getTeacherAnalyticsData(params: {
     avgVisitDurationSec:
       totalVisits > 0 ? Math.round(totalPresenceSec / totalVisits) : 0,
     visitedButNoStudyUsers: studentMetricsList.filter(
-      (s) => (s.visitsCount > 0 || s.presenceSec > 0) && s.reviewsCount === 0
+      (s) =>
+        (s.visitsCount > 0 || s.presenceSec > 0) &&
+        s.reviewsCount === 0 &&
+        s.studySec === 0
     ).length,
   };
 
@@ -1323,7 +1360,7 @@ export async function getTeacherAnalyticsData(params: {
     let overdueIncomplete = 0;
 
     uniqueStudentIds.forEach((studentId) => {
-      const stProgress = cardProgressList.filter(
+      const stProgress = teacherDeckProgress.filter(
         (cp) => cp.user_id === studentId && snapshotIds.includes(cp.card_id)
       );
       const doneCount = new Set(stProgress.map((cp) => cp.card_id)).size;
@@ -1421,7 +1458,7 @@ export async function getTeacherAnalyticsData(params: {
     );
     const classSize = classStudentsMetrics.length;
     const activeLearners = classStudentsMetrics.filter(
-      (s) => s.reviewsCount > 0 || s.sessionsCount > 0
+      (s) => s.reviewsCount > 0 || s.sessionsCount > 0 || s.studySec > 0
     ).length;
     const avgCompletionPct =
       classSize > 0
@@ -1484,7 +1521,7 @@ export async function getTeacherAnalyticsData(params: {
     scopeMode,
     dateRange: { from: fromDateStr, to: toDateStr },
     courses: virtualCourses,
-    decks: assignedDecks.map((d) => ({ id: d.id, title: d.title, course_id: d.course_id })),
+    decks: decksForDropdown.map((d) => ({ id: d.id, title: d.title, course_id: d.course_id })),
     assignments: assignments.map((a) => ({ id: a.id, title: a.title, course_id: a.course_id })),
     quizzes: quizzes.map((q) => ({ id: q.id, title: q.title, course_id: q.course_id })),
     gv1Overview,
@@ -1534,7 +1571,7 @@ export async function getTeacherStudentDetailData(studentId: string) {
   const allowedDecks = allowedDecksData || [];
   const allowedDeckIds = allowedDecks.map((d) => d.id);
 
-  const [profileRes, visitsRes, intervalsRes, sessionsRes, reviewsRes, progressRes] =
+  const [profileRes, visitsRes, intervalsRes, reviewsRes, progressRes] =
     await Promise.all([
       supabase
         .from('profiles')
@@ -1553,11 +1590,6 @@ export async function getTeacherStudentDetailData(studentId: string) {
         .eq('user_id', studentId)
         .order('start_ms', { ascending: false })
         .limit(300),
-      supabase
-        .from('study_sessions')
-        .select('*')
-        .eq('user_id', studentId)
-        .order('started_at', { ascending: false }),
       supabase
         .from('review_logs')
         .select('*')
@@ -1599,7 +1631,9 @@ export async function getTeacherStudentDetailData(studentId: string) {
     const h = getVNHour(Number(intv.start_ms));
     if (hourlyHeatmap[h]) {
       hourlyHeatmap[h].activeCount += 1;
-      if (intv.kind === 'study') hourlyHeatmap[h].studyCount += 1;
+      if (intv.kind === 'study' || (intv.path && intv.path.includes('/study'))) {
+        hourlyHeatmap[h].studyCount += 1;
+      }
     }
   });
 
@@ -1680,19 +1714,6 @@ export async function getTeacherStudentDetailData(studentId: string) {
             hasStudyActivity,
           };
         })
-      : fallbackReviews.length > 0
-      ? [
-          {
-            id: 'fallback_visit',
-            startedAt: fallbackReviews[0].reviewed_at,
-            endDisplay: `Ghi nhận cuối lúc ${new Date(fallbackReviews[0].reviewed_at).toLocaleString('vi-VN')}`,
-            deviceSummary: 'Desktop (Browser)',
-            presenceSec: fallbackReviews.length * 3,
-            activeSec: fallbackReviews.length * 3,
-            studySec: fallbackReviews.length * 3,
-            hasStudyActivity: true,
-          },
-        ]
       : [];
 
   return {

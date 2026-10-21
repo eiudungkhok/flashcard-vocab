@@ -19,20 +19,67 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
   const pathname = usePathname();
   const lastTickRef = useRef<number>(Date.now());
   const lastUserActivityRef = useRef<number>(Date.now());
-  const lastStudyInteractionRef = useRef<number>(0);
+  const lastStudyInteractionRef = useRef<number>(Date.now());
   const activeDeckIdRef = useRef<string | null>(null);
   const visitIdRef = useRef<string | null>(null);
   const lastRecordedPathRef = useRef<string>('');
   const hasSyncedLocalRef = useRef<boolean>(false);
 
-  const recordStudyInteraction = useCallback((deckId?: string) => {
-    const now = Date.now();
-    lastStudyInteractionRef.current = now;
-    lastUserActivityRef.current = now;
-    if (deckId) activeDeckIdRef.current = deckId;
-  }, []);
+  // Hàm gửi tín hiệu tức thì khi học viên tương tác trong trang học
+  const sendImmediateStudyPing = useCallback(
+    (customDeckId?: string | null) => {
+      const now = Date.now();
+      let deckIdFromUrl = customDeckId || activeDeckIdRef.current;
+      if (!deckIdFromUrl && typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        deckIdFromUrl = params.get('deck');
+      }
+      if (deckIdFromUrl) activeDeckIdRef.current = deckIdFromUrl;
 
-  // 1. Đồng bộ ngay số giây đã có trong localStorage (VD: 1 phút 17 giây) lên Database cho Giảng viên thấy ngay
+      const payload = JSON.stringify({
+        eventType: 'heartbeat',
+        visitId: visitIdRef.current,
+        path: pathname || '/student/study',
+        deckId: deckIdFromUrl || null,
+        rawStart: now - 2000,
+        rawEnd: now,
+        isActive: true,
+        isStudying: true,
+        kind: 'study',
+      });
+
+      fetch('/api/telemetry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        keepalive: true,
+      })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.visitId) {
+            visitIdRef.current = res.visitId;
+            try {
+              sessionStorage.setItem('flashlearn_visit_id', res.visitId);
+            } catch {}
+          }
+        })
+        .catch(() => {});
+    },
+    [pathname]
+  );
+
+  const recordStudyInteraction = useCallback(
+    (deckId?: string) => {
+      const now = Date.now();
+      lastStudyInteractionRef.current = now;
+      lastUserActivityRef.current = now;
+      if (deckId) activeDeckIdRef.current = deckId;
+      sendImmediateStudyPing(deckId);
+    },
+    [sendImmediateStudyPing]
+  );
+
+  // 1. Đồng bộ ngay dữ liệu thời gian có sẵn trong localStorage
   useEffect(() => {
     if (hasSyncedLocalRef.current) return;
     hasSyncedLocalRef.current = true;
@@ -74,10 +121,14 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
     } catch {}
   }, [pathname]);
 
-  // 2. Lắng nghe tương tác thật trên trang
+  // 2. Lắng nghe thao tác chuột, bàn phím, chạm màn hình
   useEffect(() => {
     const onUserActivity = () => {
-      lastUserActivityRef.current = Date.now();
+      const now = Date.now();
+      lastUserActivityRef.current = now;
+      if (window.location.pathname.includes('/study')) {
+        lastStudyInteractionRef.current = now;
+      }
     };
 
     window.addEventListener('keydown', onUserActivity, { passive: true });
@@ -93,9 +144,21 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
     };
   }, []);
 
-  // 3. Ghi nhận lượt xem trang (Page View)
+  // 3. Ghi nhận Page View & Nếu vào trang /study thì bắn tín hiệu Đang học ngay lập tức
   useEffect(() => {
     if (!pathname || pathname.startsWith('/api') || pathname.startsWith('/_next')) return;
+
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const urlDeck = params.get('deck');
+      if (urlDeck) activeDeckIdRef.current = urlDeck;
+    }
+
+    if (pathname.includes('/study')) {
+      lastStudyInteractionRef.current = Date.now();
+      sendImmediateStudyPing();
+    }
+
     if (lastRecordedPathRef.current === pathname) return;
     lastRecordedPathRef.current = pathname;
 
@@ -121,9 +184,9 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
         }
       })
       .catch(() => {});
-  }, [pathname]);
+  }, [pathname, sendImmediateStudyPing]);
 
-  // 4. Vòng lặp Heartbeat định kỳ
+  // 4. Vòng lặp Heartbeat mỗi 8 giây
   useEffect(() => {
     lastTickRef.current = Date.now();
 
@@ -143,11 +206,22 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
       );
       if (elapsedSec < 1) return;
 
+      const isOnStudyPage = pathname?.includes('/study');
       const isActive =
         now - lastUserActivityRef.current <= TRACKING_CONFIG.IDLE_THRESHOLD_SEC * 1000;
+
+      // Nếu đang mở trang /student/study và có hoạt động -> Tính là Đang học (studying)
       const isStudying =
-        pathname.includes('/study') ||
-        now - lastStudyInteractionRef.current <= TRACKING_CONFIG.STUDY_INTERACTION_WINDOW_SEC * 1000;
+        isOnStudyPage &&
+        (isActive ||
+          now - lastStudyInteractionRef.current <=
+            TRACKING_CONFIG.STUDY_INTERACTION_WINDOW_SEC * 1000);
+
+      let currentDeckId = activeDeckIdRef.current;
+      if (!currentDeckId && typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        currentDeckId = params.get('deck');
+      }
 
       try {
         const raw = localStorage.getItem('flashlearn_telemetry_stats');
@@ -177,7 +251,7 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
         eventType: isUnloading ? 'unload' : 'heartbeat',
         visitId: visitIdRef.current,
         path: pathname,
-        deckId: activeDeckIdRef.current,
+        deckId: currentDeckId || null,
         rawStart,
         rawEnd,
         isActive,
@@ -207,7 +281,7 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
       }
     };
 
-    const timer = setInterval(() => flushInterval(false), 10000);
+    const timer = setInterval(() => flushInterval(false), 8000);
 
     const onVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
@@ -215,6 +289,10 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
       } else {
         lastTickRef.current = Date.now();
         lastUserActivityRef.current = Date.now();
+        if (pathname?.includes('/study')) {
+          lastStudyInteractionRef.current = Date.now();
+          sendImmediateStudyPing();
+        }
       }
     };
 
@@ -228,7 +306,7 @@ export default function TelemetryProvider({ children }: { children: React.ReactN
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('beforeunload', onBeforeUnload);
     };
-  }, [pathname]);
+  }, [pathname, sendImmediateStudyPing]);
 
   const contextValue = useRef(
     new Proxy(
